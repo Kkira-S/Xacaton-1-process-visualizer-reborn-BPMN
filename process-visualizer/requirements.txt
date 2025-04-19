@@ -1,0 +1,6 @@
+spacy==3.8.5
+graphviz==0.20.3
+thefuzz==0.22.1
+en_core_web_md==3.8.0
+en_core_web_sm==3.8.0
+fastcoref==2.1.6

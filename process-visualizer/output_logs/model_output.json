@@ -1,0 +1,114 @@
+[
+    {
+        "entity_group": "AGENT",
+        "score": 0.9952741861343384,
+        "word": "The customer",
+        "start": 0,
+        "end": 12
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9951665997505188,
+        "word": "decides if he wants to finance or pay in cash",
+        "start": 13,
+        "end": 58
+    },
+    {
+        "entity_group": "CONDITION",
+        "score": 0.9929850101470947,
+        "word": "If the customer chooses to finance",
+        "start": 60,
+        "end": 94
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9955123662948608,
+        "word": "the customer",
+        "start": 96,
+        "end": 108
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9956878423690796,
+        "word": "fill out a loan application",
+        "start": 122,
+        "end": 149
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9960280656814575,
+        "word": "the customer",
+        "start": 163,
+        "end": 175
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9967973232269287,
+        "word": "sends the application",
+        "start": 176,
+        "end": 197
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.9745087623596191,
+        "word": "to the bank",
+        "start": 198,
+        "end": 209
+    },
+    {
+        "entity_group": "CONDITION",
+        "score": 0.9931746125221252,
+        "word": "If the customer chooses to pay in cash",
+        "start": 211,
+        "end": 249
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9956063628196716,
+        "word": "the customer",
+        "start": 251,
+        "end": 263
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9377094507217407,
+        "word": "bring the total cost of the car",
+        "start": 277,
+        "end": 308
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.9644955992698669,
+        "word": "to the dealership",
+        "start": 309,
+        "end": 326
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.8857221007347107,
+        "word": "in order to complete the transaction",
+        "start": 327,
+        "end": 363
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9963616728782654,
+        "word": "the customer",
+        "start": 422,
+        "end": 434
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9961073398590088,
+        "word": "sign the contract",
+        "start": 440,
+        "end": 457
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.7138071656227112,
+        "word": "before the transaction",
+        "start": 458,
+        "end": 480
+    }
+]

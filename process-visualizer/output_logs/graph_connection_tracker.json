@@ -1,0 +1,61 @@
+{
+    "T0": {
+        "after": [
+            "T1"
+        ],
+        "before": [
+            "START_0"
+        ]
+    },
+    "T1": {
+        "after": [
+            "T2"
+        ],
+        "before": [
+            "T0"
+        ]
+    },
+    "T2": {
+        "after": [
+            "T3"
+        ],
+        "before": [
+            "T1"
+        ]
+    },
+    "T3": {
+        "after": [
+            "T4"
+        ],
+        "before": [
+            "T2"
+        ]
+    },
+    "T4": {
+        "after": [
+            "END_1"
+        ],
+        "before": [
+            "T3"
+        ]
+    },
+    "START_0": {
+        "after": [
+            "T0",
+            "END_0"
+        ],
+        "before": []
+    },
+    "END_0": {
+        "after": [],
+        "before": [
+            "START_0"
+        ]
+    },
+    "END_1": {
+        "after": [],
+        "before": [
+            "T4"
+        ]
+    }
+}
