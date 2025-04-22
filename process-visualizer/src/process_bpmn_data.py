@@ -3,6 +3,7 @@
 import json
 import re
 import traceback # Добавлено для вывода ошибок
+import os
 
 import requests
 import spacy
@@ -17,13 +18,16 @@ from coreference_resolution.coref import get_coref_info, coref_model # Импо�
 from create_bpmn_structure import create_bpmn_structure
 from graph_generator import GraphGenerator
 from logging_utils import clear_folder, write_to_file
+from dotenv import load_dotenv
 
 # --- Константы и функции до _resolve_agent_mention без изменений ---
 BPMN_INFORMATION_EXTRACTION_ENDPOINT = "https://api-inference.huggingface.co/models/jtlicardo/bpmn-information-extraction-v2"
 ZERO_SHOT_CLASSIFICATION_ENDPOINT = (
     "https://api-inference.huggingface.co/models/facebook/bart-large-mnli"
 )
-HF_API_TOKEN = "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" # Рекомендуется вынести в переменные окружения
+load_dotenv()
+HF_API_TOKEN = os.getenv("HF_TOKEN")
+
 
 # --- spaCy модели - лучше загружать один раз ---
 try:
