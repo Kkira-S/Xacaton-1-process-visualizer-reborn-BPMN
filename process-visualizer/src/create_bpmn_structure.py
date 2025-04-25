@@ -1,614 +1,623 @@
 # --- START OF FILE create_bpmn_structure.py ---
 
-from logging_utils import write_to_file
+import uuid
+from collections import defaultdict
+import math
+from colorama import Fore, init # Добавлено для цветного вывода
+import json # <-- ДОБАВИТЬ ИМПОРТ JSON
+import deepseek_prompts as prompts # <-- Убедитесь, что импорт есть
+import traceback # <-- Для отладки
 
-# TODO: Адаптировать класс GraphGenerator для использования новой структуры агента!
-#       Имя агента для дорожки теперь находится в element['content']['agent']['resolved_word']
+init(autoreset=True) # Инициализация colorama
 
-def create_bpmn_structure(
-    agent_task_pairs: list[dict],
-    parallel_gateway_data: list[dict],
-    exclusive_gateway_data: list[dict],
-    process_info: list[dict],
-) -> list[dict] | None: # Добавлен None для возможной ошибки
-    """
-    Creates a BPMN structure from the agent-task pairs, parallel gateways and exclusive gateways.
-    The BPMN structure can be used to create a visual representation of the BPMN diagram.
+# --- Константы для раскладки (можно настроить) ---
+DEFAULT_WIDTH = 100
+DEFAULT_HEIGHT = 80
+EVENT_WIDTH = 36
+EVENT_HEIGHT = 36
+GATEWAY_WIDTH = 50
+GATEWAY_HEIGHT = 50
+POOL_PADDING_X = 50
+POOL_PADDING_Y = 50
+LANE_HEADER_WIDTH = 30
+LANE_PADDING_Y = 40 # Увеличим отступ внутри дорожки
+VERTICAL_SPACING = 100 # Увеличим вертикальный отступ
+HORIZONTAL_SPACING = 200 # Увеличим горизонтальный отступ
+LANE_MIN_HEIGHT = DEFAULT_HEIGHT + LANE_PADDING_Y * 2
+CONNECTION_POINT_OFFSET = 5
 
-    Args:
-        agent_task_pairs (list[dict]): A list of agent-task pairs.
-                                       Expected structure for agent: pair['agent'] =
-                                       {'original_word': str, 'resolved_word': str, 'entity': dict}
-                                       OR pair['agent'] might be missing if it's a loop element.
-        parallel_gateway_data (list[dict]): A list of parallel gateway data.
-        exclusive_gateway_data (list[dict]): A list of exclusive gateway data.
-        process_info (list[dict]): A list of process info entities.
+def generate_unique_id(prefix=""):
+    """Генерирует уникальный ID с префиксом."""
+    return f"{prefix}_{uuid.uuid4().hex[:8]}"
 
-    Returns:
-        list[dict] | None: A list of BPMN structure elements ready for GraphGenerator, or None if input is invalid.
-    """
-    if not isinstance(agent_task_pairs, list):
-         print(f"ERROR in create_bpmn_structure: Invalid input 'agent_task_pairs' (expected list, got {type(agent_task_pairs)}).")
-         return None
+def get_element_center(bounds):
+    """Возвращает координаты центра элемента."""
+    if not bounds or not all(k in bounds for k in ['x', 'y', 'width', 'height']):
+        return {"x": 0, "y": 0}
+    return {
+        "x": bounds["x"] + bounds["width"] // 2,
+        "y": bounds["y"] + bounds["height"] // 2
+    }
 
-    # Шаг 1: Форматирование пар (перенос данных в 'content')
-    # Эта функция корректно обработает новую структуру агента внутри content.
-    formatted_pairs = format_agent_task_pairs(agent_task_pairs)
-
-    # Копируем для дальнейшей модификации (добавление в шлюзы)
-    elements_to_process = formatted_pairs.copy()
-
-    # Шаг 2: Объединение и сортировка шлюзов
-    gateways = parallel_gateway_data + exclusive_gateway_data
-    # Сортируем по "размеру" (разница между концом и началом) - не уверен, лучшая ли это сортировка?
-    # Возможно, лучше сортировать по началу: sorted(gateways, key=lambda x: x.get('start', float('inf')))
-    gateways = sorted(gateways, key=calculate_distance) # Используем существующую функцию
-
-    # Шаг 3: Добавление задач/циклов в соответствующие пути шлюзов
-    # Эта функция модифицирует и gateways (добавляя children), и elements_to_process (удаляя добавленные)
-    add_tasks_to_gateways(elements_to_process, gateways, process_info)
-    write_to_file("bpmn_structure/gateways_with_children.json", gateways) # Переименовал лог
-
-    # Шаг 4: Построение иерархии вложенных шлюзов
-    # Эта функция работает с уже модифицированным списком gateways
-    nested_gateways = nest_gateways(gateways)
-    write_to_file("bpmn_structure/nested_gateways_structure.json", nested_gateways) # Переименовал лог
-
-    # Шаг 5: Объединение оставшихся задач/циклов и шлюзов верхнего уровня
-    # elements_to_process теперь содержит только те элементы, что не попали ни в один шлюз
-    final_structure = elements_to_process + nested_gateways
-
-    # Шаг 6: Финальная сортировка по начальной позиции
-    final_structure = sorted(final_structure, key=lambda x: get_start_idx(x) if get_start_idx(x) is not None else float('inf'))
-
-    print("Final BPMN structure created.")
-    # Запись финальной структуры в файл (как и раньше)
-    write_to_file("bpmn_structure/bpmn_final_structure.json", final_structure) # Переименовал лог
-
-    return final_structure
-
-
-def get_start_idx(element: dict) -> int | None:
-    """
-    Safely gets the start index of a BPMN structure element.
-    Args:
-        element (dict): A BPMN structure element (task, loop, gateway).
-    Returns:
-        int | None: The start index or None if not found.
-    """
-    if isinstance(element, dict):
-        # Для шлюзов или элементов цикла с ключом 'start'
-        if "start" in element:
-            return element["start"]
-        # Для отформатированных пар (задач)
-        elif "content" in element and isinstance(element["content"], dict):
-            content = element["content"]
-            # Если это задача
-            if "task" in content and isinstance(content["task"], dict):
-                return content["task"].get("start") # Используем .get
-            # Если это был цикл (go_to), у него должен быть 'start' напрямую в content
-            elif "start" in content:
-                 return content["start"]
-    # Если не удалось найти индекс
+def find_element_by_internal_id(elements_data: list, internal_id: str) -> dict | None:
+    """Находит элемент в списке all_elements_data по internal_id."""
+    if not internal_id: return None # Проверка на пустой ID
+    for elem in elements_data:
+        if elem.get("internal_id") == internal_id:
+            return elem
     return None
 
+def find_first_element_after(elements_data: list, start_search_index: int, element_types: list[str]) -> dict | None:
+    """Находит первый элемент указанных типов после заданного индекса."""
+    if start_search_index < 0 or start_search_index >= len(elements_data) -1 :
+         return None
+    for i in range(start_search_index + 1, len(elements_data)):
+        elem_type = elements_data[i].get("type")
+        if elem_type in element_types:
+            return elements_data[i]
+    return None
 
-def format_agent_task_pairs(agent_task_pairs: list[dict]) -> list[dict]:
-    """
-    Formats agent-task pairs into the structure expected by subsequent functions.
-    Moves original pair content into a 'content' key and adds a 'type' key.
-    Args:
-        agent_task_pairs (list[dict]): The list of agent-task pairs from process_bpmn_data.
-                                       Handles new agent structure: pair['agent'] = {'resolved_word': ...}
-    Returns:
-        list[dict]: Formatted list.
-    """
-    formatted_list = []
-    for original_pair in agent_task_pairs:
-        # Создаем новый словарь для форматированного элемента
-        formatted_pair = {}
-        # Копируем все содержимое исходной пары в ключ 'content'
-        # Это автоматически включает новую структуру 'agent': {'original_word': ..., 'resolved_word': ..., 'entity': ...}
-        formatted_pair["content"] = original_pair.copy()
-        # Определяем тип элемента
-        if "task" in original_pair:
-            formatted_pair["type"] = "task"
-        elif "go_to" in original_pair: # Проверяем наличие ключа цикла
-            formatted_pair["type"] = "loop"
-            # Добавляем start/end из content в корень для сортировки/привязки, если их нет
-            if "start" not in formatted_pair and "start" in formatted_pair["content"]:
-                 formatted_pair["start"] = formatted_pair["content"]["start"]
-            if "end" not in formatted_pair and "end" in formatted_pair["content"]:
-                 formatted_pair["end"] = formatted_pair["content"]["end"]
-        else:
-            formatted_pair["type"] = "unknown" # На случай непредвиденной структуры
-            print(f"Warning in format_agent_task_pairs: Unknown pair type: {original_pair}")
-
-        formatted_list.append(formatted_pair)
-
-    return formatted_list
+def find_element_by_bpmn_id(flow_elements: list, bpmn_id: str) -> dict | None:
+     """Находит семантический элемент по его BPMN ID."""
+     return next((elem for elem in flow_elements if elem.get("id") == bpmn_id), None)
 
 
-def gateway_contains_nested_gateways(gateway: dict, all_gateways: list[dict]) -> bool:
-    """
-    Checks if a gateway contains any other gateways strictly within its start/end bounds.
-    Args:
-        gateway (dict): The potential outer gateway.
-        all_gateways (list[dict]): The list of all gateways.
-    Returns:
-        bool: True if it contains nested gateways, False otherwise.
-    """
-    gw_start = gateway.get("start")
-    gw_end = gateway.get("end")
+def create_bpmn_structure(
+    agent_task_pairs_or_loops: list, # Изменено имя параметра
+    parallel_gateways: list,
+    exclusive_gateways: list,
+    process_info_entities: list,
+    unique_agents: list,
+    original_text: str
+) -> dict | None:
+    print("Starting BPMN JSON structure creation...")
+    if not isinstance(agent_task_pairs_or_loops, list) or \
+       not isinstance(parallel_gateways, list) or \
+       not isinstance(exclusive_gateways, list) or \
+       not isinstance(unique_agents, list):
+        print(f"{Fore.RED}Error: Invalid input data types for structure creation.{Fore.RESET}")
+        return None
 
-    if gw_start is None or gw_end is None:
-        return False # Не можем проверить без границ
+    # --- 1. Инициализация ---
+    definitions_id = generate_unique_id("Definitions")
+    collaboration_id = generate_unique_id("Collaboration")
+    process_id = generate_unique_id("Process")
+    diagram_id = generate_unique_id("BPMNDiagram")
+    plane_id = generate_unique_id("BPMNPlane")
 
-    for other_g in all_gateways:
-        # Пропускаем сравнение шлюза с самим собой
-        if other_g.get("id") == gateway.get("id"):
-            continue
-
-        other_start = other_g.get("start")
-        other_end = other_g.get("end")
-
-        if other_start is not None and other_end is not None:
-            # Строгое вложение: другой шлюз начинается после начала текущего
-            # и заканчивается до конца текущего.
-            if other_start > gw_start and other_end < gw_end:
-                return True
-    return False
-
-
-def add_tasks_to_gateways(
-    elements_to_process: list[dict], gateways: list[dict], process_info: list[dict]
-) -> None:
-    """
-    Adds BPMN elements (tasks, loops) to the corresponding gateway paths based on their start indices.
-    Modifies 'gateways' by adding 'children' lists and 'elements_to_process' by removing added elements.
-    Args:
-        elements_to_process (list[dict]): List of formatted BPMN elements (tasks/loops) to potentially add.
-        gateways (list[dict]): List of gateway dictionaries (will be modified).
-        process_info (list[dict]): List of process info entities (used for handling PROCESS_CONTINUE).
-    Returns:
-        None
-    """
-    processed_element_indices = set() # Отслеживаем добавленные элементы по индексу в исходном списке
-
-    for gateway in gateways:
-        gateway_id = gateway.get("id", "unknown_gateway")
-        gateway_start = gateway.get("start")
-        gateway_end = gateway.get("end")
-        gateway_paths = gateway.get("paths", [])
-
-        # Инициализируем 'children', если их нет
-        if "children" not in gateway:
-             gateway["children"] = [[] for _ in range(len(gateway_paths))]
-        # Убедимся, что количество списков children совпадает с количеством путей
-        elif len(gateway["children"]) != len(gateway_paths):
-             print(f"Warning: Mismatch between children lists ({len(gateway['children'])}) and paths ({len(gateway_paths)}) for gateway {gateway_id}. Reinitializing children.")
-             gateway["children"] = [[] for _ in range(len(gateway_paths))]
+    semantic_participants = []
+    semantic_lanes = []
+    semantic_lane_sets = []
+    semantic_flow_nodes = [] # Задачи, События, Шлюзы
+    semantic_sequence_flows = []
+    visual_shapes = []
+    visual_edges = []
+    element_map = {} # internal_id -> bpmn_element (семантический)
+    element_coords = {} # bpmn_element_id -> {"x", "y", "width", "height"}
+    agent_lane_map = {} # resolved_agent_word.lower() -> lane_id
+    lane_flow_nodes = defaultdict(list) # lane_id -> list of flowNode IDs
+    diverging_to_converging_map = {} # diverging_gw_internal_id -> converging_gw_bpmn_id
 
 
-        gateway["type"] = "parallel" if gateway_id.startswith("PG") else "exclusive"
+    # --- 2. Создание Участников (Пулов) и Дорожек (Lanes) ---
+    print("Creating Pools and Lanes...")
+    if not unique_agents:
+        print(f"{Fore.YELLOW}Warning: No unique agents found. Creating a default pool and lane.{Fore.RESET}")
+        unique_agents = ["Default Process"]
 
-        for i, path in enumerate(gateway_paths):
-            path_start = path.get("start")
-            path_end = path.get("end")
+    main_pool_id = generate_unique_id("Participant")
+    main_pool_name = unique_agents[0] if len(unique_agents) == 1 else "Main Process Collaboration"
+    semantic_participants.append({"id": main_pool_id, "name": main_pool_name, "processRef": process_id})
 
-            if path_start is None or path_end is None:
-                print(f"Warning: Path {i} in gateway {gateway_id} has invalid indices. Skipping.")
-                continue
+    lane_set_id = generate_unique_id("LaneSet")
+    for agent_name in unique_agents:
+        lane_id = generate_unique_id("Lane")
+        agent_key = agent_name.lower() if isinstance(agent_name, str) else str(agent_name)
+        agent_lane_map[agent_key] = lane_id
+        semantic_lanes.append({"id": lane_id, "name": agent_name, "flowNodeRef": []})
 
-            # Ищем элементы, попадающие в текущий путь
-            elements_in_path = []
-            indices_to_remove = [] # Индексы для удаления из elements_to_process
-
-            for elem_idx, element in enumerate(elements_to_process):
-                 if elem_idx in processed_element_indices:
-                      continue # Пропускаем уже обработанные
-
-                 elem_start_idx = get_start_idx(element)
-
-                 if elem_start_idx is not None:
-                     # Элемент принадлежит пути, если его начало внутри диапазона пути
-                     # Используем path_end + 1, т.к. range не включает верхнюю границу
-                     if path_start <= elem_start_idx < path_end + 1:
-                         elements_in_path.append(element)
-                         indices_to_remove.append(elem_idx) # Помечаем для удаления
-
-            # Добавляем найденные элементы в children шлюза
-            if elements_in_path:
-                 # Сортируем элементы внутри пути по их началу
-                 elements_in_path.sort(key=lambda x: get_start_idx(x) if get_start_idx(x) is not None else float('inf'))
-                 gateway["children"][i].extend(elements_in_path)
-                 # Обновляем множество обработанных индексов
-                 processed_element_indices.update(indices_to_remove)
-
-            # --- Обработка условий (перенесена) ---
-            # Удаляем 'condition' из всех элементов пути, кроме первого (для эксклюзивных)
-            # Или сохраняем первое условие на уровне шлюза (для параллельных - ???)
-            children_list = gateway["children"][i]
-            first_condition_found = None
-            for child_idx, child in enumerate(children_list):
-                 if "condition" in child.get("content", {}):
-                     if gateway["type"] == "exclusive":
-                          if child_idx > 0: # Удаляем у всех, кроме первого
-                              del child["content"]["condition"]
-                     elif gateway["type"] == "parallel":
-                           # В параллельном шлюзе условие обычно относится ко всему шлюзу
-                           if first_condition_found is None:
-                                first_condition_found = child["content"]["condition"]
-                           # Удаляем из всех дочерних элементов в параллельном пути
-                           del child["content"]["condition"]
-
-            # Сохраняем первое найденное условие на уровне параллельного шлюза (если нужно)
-            if gateway["type"] == "parallel" and first_condition_found and "condition" not in gateway:
-                 gateway["condition"] = first_condition_found
-            # --- Конец обработки условий ---
-
-
-        # --- Обработка PROCESS_CONTINUE (после добавления всех задач) ---
-        if gateway["type"] == "exclusive":
-            # Ищем PROCESS_CONTINUE сущности, связанные с этим шлюзом
-            process_continue_entities = [
-                e
-                for e in process_info
-                if e["entity_group"] == "PROCESS_CONTINUE"
-                and gateway_start is not None and gateway_end is not None # Проверка границ шлюза
-                and gateway_start <= e.get("start", -1) < gateway_end + 1
-            ]
-
-            # Если нашли ровно одну сущность "продолжение" для этого шлюза
-            if len(process_continue_entities) == 1:
-                # И если шлюз НЕ содержит вложенных шлюзов (логика handle_process_continue)
-                if not gateway_contains_nested_gateways(gateway, gateways):
-                     handle_process_continue_entity(
-                         elements_to_process, # Передаем ОСТАВШИЕСЯ элементы
-                         gateways, # Передаем все шлюзы
-                         gateway # Текущий шлюз
-                     )
-            elif len(process_continue_entities) > 1:
-                 print(f"Warning: Multiple PROCESS_CONTINUE entities found within exclusive gateway {gateway_id}. Behavior undefined.")
-        # --- Конец обработки PROCESS_CONTINUE ---
-
-
-    # Удаляем элементы, которые были добавлены в шлюзы, из основного списка
-    # Идем по индексам в обратном порядке, чтобы не сбить нумерацию при удалении
-    if processed_element_indices:
-         sorted_indices_to_remove = sorted(list(processed_element_indices), reverse=True)
-         for index in sorted_indices_to_remove:
-              if 0 <= index < len(elements_to_process): # Доп. проверка индекса
-                  del elements_to_process[index]
-              else:
-                   print(f"Warning: Attempted to remove element at invalid index {index}.")
-
-
-def handle_process_continue_entity(
-    remaining_elements: list[dict], all_gateways: list[dict], current_gateway: dict
-) -> None:
-    """
-    Handles the PROCESS_CONTINUE entity in exclusive gateways by adding a "continue" element
-    to empty paths, pointing to the next element after the gateway.
-    Modifies the 'children' list of the current_gateway.
-    Args:
-        remaining_elements (list[dict]): List of BPMN elements *not* assigned to any gateway yet.
-        all_gateways (list[dict]): List of all gateways (used for context, not modified).
-        current_gateway (dict): The exclusive gateway dictionary (will be modified).
-    Returns:
-        None
-    """
-    # Эта логика применяется только если шлюз НЕ содержит вложенных (уже проверено снаружи)
-    gateway_end_idx = current_gateway.get("end")
-    if gateway_end_idx is None:
-        return # Не можем определить следующий элемент
-
-    next_element_id = None
-    min_start_after_gateway = float('inf')
-
-    # Ищем первый элемент (задачу или цикл), который начинается СТРОГО после текущего шлюза
-    for element in remaining_elements:
-        elem_start = get_start_idx(element)
-        if elem_start is not None and elem_start > gateway_end_idx:
-            if elem_start < min_start_after_gateway:
-                 min_start_after_gateway = elem_start
-                 # Получаем ID задачи, если это задача
-                 if element.get("type") == "task" and "task_id" in element.get("content", {}).get("task", {}):
-                      next_element_id = element["content"]["task"]["task_id"]
-                 # Если это цикл, у него нет ID, но он может быть следующим элементом
-                 # В BPMN обычно 'continue' ведет к задаче или merge-шлюзу.
-                 # Пока просто запоминаем, что есть следующий элемент.
-                 elif element.get("type") == "loop":
-                      # Может быть, стоит искать следующую *задачу*, а не цикл?
-                      pass # Игнорируем цикл как цель для continue?
-
-    # Если не нашли следующий элемент среди оставшихся, ищем в других шлюзах
-    if next_element_id is None:
-         next_gateway = None
-         min_gw_start_after = float('inf')
-         for gw in all_gateways:
-             gw_start = gw.get("start")
-             # Ищем шлюз, начинающийся строго после текущего
-             if gw_start is not None and gw_start > gateway_end_idx:
-                  if gw_start < min_gw_start_after:
-                       min_gw_start_after = gw_start
-                       next_gateway = gw
-         if next_gateway:
-              # Цель - сам ID следующего шлюза
-              next_element_id = next_gateway.get("id")
-
-    # Если нашли куда переходить (ID задачи или шлюза)
-    if next_element_id:
-        # Добавляем элемент 'continue' во все ПУСТЫЕ пути текущего шлюза
-        for i in range(len(current_gateway.get("children", []))):
-            if not current_gateway["children"][i]: # Если путь пуст
-                current_gateway["children"][i].append(
-                    {"content": {"go_to": next_element_id}, "type": "continue"}
-                )
-                print(f"Added 'continue' element to path {i} of gateway {current_gateway.get('id')}, pointing to {next_element_id}")
+    if semantic_lanes:
+        semantic_lane_sets.append({"id": lane_set_id, "lanes": [lane["id"] for lane in semantic_lanes]})
+        process_has_laneset = True
     else:
-         print(f"Warning: Could not find next element after exclusive gateway {current_gateway.get('id')} to point 'continue' elements to.")
+        process_has_laneset = False
+        default_lane_id = None
+        print(f"{Fore.YELLOW}Warning: No lanes created, elements will not be assigned to lanes.{Fore.RESET}")
 
 
-def calculate_distance(gateway: dict) -> int:
-    """
-    Calculates the 'distance' or span of a gateway (end - start).
-    Used for sorting gateways. Returns a large number if indices are missing.
-    Args:
-        gateway (dict): Gateway dictionary.
-    Returns:
-        int: The difference between end and start, or infinity if indices are invalid.
-    """
-    start = gateway.get("start")
-    end = gateway.get("end")
-    if start is not None and end is not None and end >= start:
-        return end - start
-    else:
-        # Возвращаем большое значение, чтобы некорректные шлюзы оказались в конце сортировки
-        return float('inf')
+    # --- 3. Построение Графа Потока Управления (Семантика) ---
+    print("Building semantic flow graph...")
+
+    # --- 3.1 Объединение и сортировка ---
+    all_elements_data = []
+    for i, elem_info in enumerate(agent_task_pairs_or_loops):
+        element_type = "unknown"; internal_id = None; start_index = None; data = elem_info
+        if isinstance(elem_info, dict):
+            if "task" in elem_info:
+                element_type = "task"
+                internal_id = elem_info["task"].get("task_id")
+                if not internal_id: internal_id = f"AutoGenTask_{i}"
+                start_index = elem_info["task"].get("start")
+            elif "go_to" in elem_info:
+                element_type = "loop"
+                internal_id = f"LoopMarker_{i}"
+                start_index = elem_info.get("start")
+            else: continue
+            if start_index is not None:
+                all_elements_data.append({
+                    "type": element_type, "internal_id": internal_id,
+                    "original_index": i, "start": start_index, "data": data
+                })
+            else: print(f"{Fore.YELLOW}Warning: Element type '{element_type}' lacks start index. Skipping.{Fore.RESET}")
+        else: continue
+
+    gateways_data = parallel_gateways + exclusive_gateways
+    for gw in gateways_data:
+        gw_type = "parallel_gateway" if gw.get("id", "").startswith("PG") else "exclusive_gateway"
+        start_index = gw.get("start"); gw_internal_id = gw.get("id")
+        if start_index is not None and gw_internal_id:
+            all_elements_data.append({
+                "type": gw_type, "internal_id": gw_internal_id,
+                "original_index": -1, "start": start_index, "data": gw
+            })
+        else: print(f"{Fore.YELLOW}Warning: Gateway {gw_internal_id or 'Unknown'} lacks start index or ID, skipping.{Fore.RESET}")
+
+    all_elements_data.sort(key=lambda x: x.get("start", float('inf')))
+    element_indices_map = {elem_data["internal_id"]: i for i, elem_data in enumerate(all_elements_data)}
+
+    # --- 3.2 Создание BPMN Элементов (Узлы) ---
+    print("Creating nodes...")
+
+    def get_lane_for_element(element_data: dict, fallback_lane_id: str | None) -> str | None:
+        agent_name = None; lane_id = None
+        elem_type = element_data.get("type")
+        internal_id_ctx = element_data.get("internal_id")
+
+        agent_info = None
+        if elem_type == "task": agent_info = element_data["data"].get("agent", {})
+        elif elem_type == "loop": agent_info = element_data["data"].get("original_loop_agent", {})
+        elif elem_type == "converging_gateway":
+            diverging_gw_internal_id = element_data.get("diverging_gw_internal_id")
+            if diverging_gw_internal_id:
+                 diverging_gw_bpmn = element_map.get(diverging_gw_internal_id)
+                 if diverging_gw_bpmn: return diverging_gw_bpmn.get("lane")
+
+        if agent_info:
+            agent_name = agent_info.get("resolved_word")
+            if agent_name and isinstance(agent_name, str): lane_id = agent_lane_map.get(agent_name.lower())
+
+        elif elem_type in ["exclusive_gateway", "parallel_gateway"]:
+             current_index = element_indices_map.get(internal_id_ctx)
+             if current_index is not None and current_index > 0:
+                 for k in range(current_index - 1, -1, -1):
+                     prev_elem_data = all_elements_data[k]
+                     if prev_elem_data.get("type") != "loop":
+                         prev_bpmn_elem = element_map.get(prev_elem_data.get("internal_id"))
+                         if prev_bpmn_elem: lane_id = prev_bpmn_elem.get("lane"); break
+
+        elif internal_id_ctx == "START" and semantic_lanes: return semantic_lanes[0]["id"]
+        elif internal_id_ctx == "END" and semantic_lanes:
+             last_flow_elem_data = next((e for e in reversed(all_elements_data) if e['type'] != 'loop'), None)
+             if last_flow_elem_data:
+                  last_bpmn_elem = element_map.get(last_flow_elem_data.get("internal_id"))
+                  if last_bpmn_elem and "lane" in last_bpmn_elem: return last_bpmn_elem["lane"]
+             return semantic_lanes[-1]["id"] # Fallback
+
+        if not lane_id and fallback_lane_id: lane_id = fallback_lane_id
+        return lane_id
+
+    default_lane_id = semantic_lanes[0]["id"] if semantic_lanes else None
+
+    # StartEvent
+    start_event_id = generate_unique_id("StartEvent")
+    start_event_data_ctx = {"type": "event", "internal_id": "START"}
+    start_event = {"id": start_event_id, "type": "bpmn:StartEvent", "name": "Start"}
+    start_lane = get_lane_for_element(start_event_data_ctx, default_lane_id)
+    if start_lane: start_event["lane"] = start_lane; lane_flow_nodes[start_lane].append(start_event_id)
+    semantic_flow_nodes.append(start_event); element_map["START"] = start_event
+
+    # Основные узлы (Первый проход - создание)
+    temp_element_refs = {}
+    for index, elem_data in enumerate(all_elements_data):
+        elem_type = elem_data["type"]; internal_id = elem_data["internal_id"]; data = elem_data["data"]; bpmn_element = None; bpmn_element_id = None
+        if elem_type == "loop": continue
+
+        if elem_type == "task":
+            bpmn_element_id = generate_unique_id("UserTask"); task_name = data.get("task", {}).get("word", "Unnamed Task"); bpmn_element = {"id": bpmn_element_id, "type": "bpmn:UserTask", "name": task_name}; original_task_id = internal_id
+            if original_task_id: element_map[original_task_id] = bpmn_element
+        elif elem_type == "exclusive_gateway":
+            bpmn_element_id = internal_id  # Используем ID шлюза из данных (EG0, EG1...)
+            gw_name = data.get("name", f"Choice {bpmn_element_id}")
+            # Убираем префикс "Assistant:" если он есть
+            if gw_name.startswith("Assistant:"):
+                gw_name = gw_name[len("Assistant:"):].strip()
+            bpmn_element = {"id": bpmn_element_id, "type": "bpmn:ExclusiveGateway", "name": gw_name}
+            element_map[internal_id] = bpmn_element  # Сохраняем связь
+        elif elem_type == "parallel_gateway":
+            bpmn_element_id = internal_id  # Используем ID шлюза из данных (PG0, PG1...)
+            gw_name = data.get("name", f"Parallel {bpmn_element_id}")
+            # Убираем префикс "Assistant:" если он есть
+            if gw_name.startswith("Assistant:"):
+                gw_name = gw_name[len("Assistant:"):].strip()
+            bpmn_element = {"id": bpmn_element_id, "type": "bpmn:ParallelGateway", "name": gw_name}
+            element_map[internal_id] = bpmn_element  # Сохраняем связь
+        if bpmn_element:
+             semantic_flow_nodes.append(bpmn_element)
+             if bpmn_element_id: temp_element_refs[bpmn_element_id] = internal_id
+
+    # Второй проход для присвоения дорожек
+    for bpmn_node in semantic_flow_nodes:
+        node_id = bpmn_node.get("id")
+        if bpmn_node['type'] == "bpmn:StartEvent" or "lane" in bpmn_node: continue
+        internal_id_ref = temp_element_refs.get(node_id)
+        if not internal_id_ref: continue
+        elem_data_ref = find_element_by_internal_id(all_elements_data, internal_id_ref)
+        if elem_data_ref:
+            current_lane_id = get_lane_for_element(elem_data_ref, default_lane_id)
+            if current_lane_id: bpmn_node["lane"] = current_lane_id; lane_flow_nodes[current_lane_id].append(node_id)
+
+    # EndEvent
+    end_event_id = generate_unique_id("EndEvent")
+    end_event_data_ctx = {"type": "event", "internal_id": "END"}
+    end_event = {"id": end_event_id, "type": "bpmn:EndEvent", "name": "End"}
+    end_lane = get_lane_for_element(end_event_data_ctx, default_lane_id)
+    if end_lane: end_event["lane"] = end_lane; lane_flow_nodes[end_lane].append(end_event_id)
+    semantic_flow_nodes.append(end_event); element_map["END"] = end_event
 
 
-def nest_gateways(all_gateways: list[dict]) -> list[dict]:
-    """
-    Nests gateways based on their start/end indices and parent references (if added previously).
-    Args:
-        all_gateways (list[dict]): A list of gateway dictionaries (potentially modified by add_tasks_to_gateways).
-    Returns:
-        list[dict]: A list of top-level gateways, with nested gateways moved inside their parents' 'children'.
-    """
-    gateway_map = {gw.get("id"): gw for gw in all_gateways if gw.get("id")}
-    nested_ids = set() # Сохраняем ID шлюзов, которые были вложены
+    # --- 3.3 Создание Потоков Управления (Новый Алгоритм v4 - Явный обход) ---
+    print("Creating sequence flows (Revised Algorithmic Approach v4)...")
+    created_flows = set()
+    semantic_sequence_flows = []
+    processed_sources = set() # BPMN ID источников, у которых уже создан исходящий поток
 
-    # Сначала обрабатываем явные ссылки родитель-потомок (из extract_exclusive_gateways)
-    for gateway in all_gateways:
-        parent_id = gateway.get("parent_gateway_id")
-        parent_path_idx = gateway.get("parent_gateway_path_id") # Используем индекс пути
+    def add_flow(source_id, target_id, name=None):
+        if not source_id or not target_id or source_id == target_id: return False
+        flow_tuple = (source_id, target_id)
+        if flow_tuple in created_flows: return False
+        flow_id = generate_unique_id("Flow"); flow_data = {"id": flow_id, "sourceRef": source_id, "targetRef": target_id}
+        if name and isinstance(name, str) and name.strip(): flow_data["name"] = name.strip()
+        semantic_sequence_flows.append(flow_data); created_flows.add(flow_tuple);
+        processed_sources.add(source_id) # Помечаем источник как обработанный
+        # print(f"DEBUG Flow: Added {source_id} -> {target_id} (Name: {name})")
+        return True
 
-        if parent_id and parent_id in gateway_map and parent_path_idx is not None:
-            parent_gw = gateway_map[parent_id]
-            # Убедимся, что у родителя есть 'children' и нужный индекс пути
-            if "children" in parent_gw and 0 <= parent_path_idx < len(parent_gw["children"]):
-                # Ищем, куда вставить вложенный шлюз, сохраняя порядок по 'start'
-                target_path_children = parent_gw["children"][parent_path_idx]
-                insert_in_sorted_order(target_path_children, gateway)
-                nested_ids.add(gateway.get("id")) # Помечаем как вложенный
+    # --- Основной цикл обработки элементов ---
+    last_processed_bpmn_id = start_event_id # Начинаем со StartEvent
+    processed_element_indices = set() # Индексы обработанных элементов в all_elements_data
+
+    for i, current_elem_data in enumerate(all_elements_data):
+        current_internal_id = current_elem_data["internal_id"]
+        current_bpmn_elem = element_map.get(current_internal_id)
+        elem_type = current_elem_data["type"]
+
+        if elem_type == "loop" or not current_bpmn_elem: continue
+        current_bpmn_id = current_bpmn_elem["id"]
+
+        # --- Обработка Расходящихся Шлюзов ---
+        is_diverging_gateway = elem_type in ["exclusive_gateway", "parallel_gateway"]
+        if is_diverging_gateway:
+            print(f"  Processing Diverging Gateway: {current_bpmn_elem.get('name', current_bpmn_id)}")
+            gateway_data = current_elem_data["data"]; conditions = gateway_data.get("conditions", [])
+
+            # Получаем ветки от LLM
+            subsequent_tasks_for_llm = []
+            for k in range(i + 1, len(all_elements_data)):
+                elem_k_data = all_elements_data[k]; elem_k_type = elem_k_data["type"]; elem_k_internal_id = elem_k_data["internal_id"]
+                if elem_k_type in ["task", "exclusive_gateway", "parallel_gateway"]:
+                     task_text = elem_k_data["data"].get("task", {}).get("word", elem_k_internal_id) if elem_k_type == "task" else elem_k_data["data"].get("name", elem_k_internal_id)
+                     subsequent_tasks_for_llm.append({"id": elem_k_internal_id, "text": task_text})
+                if len(subsequent_tasks_for_llm) >= 10: break
+            context_text = original_text[max(0, gateway_data.get("start", 0) - 150) : gateway_data.get("end", len(original_text)) + 150]
+
+            branch_starts = {} # cond_idx -> immediate_task_internal_id
+            llm_call_success = False
+            print(f"    DEBUG: Calling LLM for gateway {current_internal_id}...") # Отладка
+            if prompts.model_loaded and subsequent_tasks_for_llm:
+                try:
+                    llm_response_str = prompts.determine_gateway_flow(current_internal_id, conditions, subsequent_tasks_for_llm, context_text)
+                    if llm_response_str:
+                         llm_flow_data = json.loads(llm_response_str)
+                         print(f"    LLM suggested branch starts for {current_internal_id}: {llm_flow_data.get('branches')}")
+                         for branch_info in llm_flow_data.get("branches", []):
+                             cond_idx = branch_info.get("condition_index")
+                             immediate_task_id = branch_info.get("immediate_task_id")
+                             if immediate_task_id and element_map.get(immediate_task_id):
+                                 if elem_type == "parallel_gateway": branch_starts[len(branch_starts)] = immediate_task_id
+                                 elif cond_idx is not None: branch_starts[cond_idx] = immediate_task_id
+                                 llm_call_success = True
+                             else: print(f"{Fore.YELLOW}Warning: LLM suggested immediate task '{immediate_task_id}' for branch {cond_idx} not found or invalid.{Fore.RESET}")
+                    else: print(f"{Fore.YELLOW}Warning: LLM returned empty response for {current_internal_id}.{Fore.RESET}")
+                except Exception as e: print(f"{Fore.RED}Error parsing LLM flow response for {current_internal_id}: {e}{Fore.RESET}")
+            else: print(f"{Fore.YELLOW}Warning: Skipping LLM call for {current_internal_id} (model loaded: {prompts.model_loaded}, tasks: {bool(subsequent_tasks_for_llm)}){Fore.RESET}")
+
+            if not llm_call_success:
+                 print(f"{Fore.YELLOW}Warning: Could not determine branch starts for {current_internal_id}. Using basic fallback.{Fore.RESET}")
+                 next_elem_data = find_first_element_after(all_elements_data, i, ["task", "exclusive_gateway", "parallel_gateway"])
+                 target_bpmn_id = element_map.get(next_elem_data["internal_id"], {}).get('id') if next_elem_data else end_event_id
+                 if target_bpmn_id: add_flow(current_bpmn_id, target_bpmn_id)
+                 last_processed_bpmn_id = target_bpmn_id # Обновляем последний обработанный
+                 continue # Переходим к следующему элементу основного цикла
+
+            # --- Создаем Сходящийся Шлюз ---
+            converging_gateway_id = generate_unique_id("ConvergeGateway")
+            converging_gateway_type = "bpmn:ExclusiveGateway" if elem_type == "exclusive_gateway" else "bpmn:ParallelGateway"
+            converging_gateway = {"id": converging_gateway_id, "type": converging_gateway_type, "name": ""}
+            semantic_flow_nodes.append(converging_gateway); element_map[converging_gateway_id] = converging_gateway
+            diverging_to_converging_map[current_internal_id] = converging_gateway_id
+            print(f"    Created Converging Gateway: {converging_gateway_id} for {current_internal_id}")
+
+            # --- Обработка Каждой Ветки ---
+            branch_end_elements = [] # Сохраняем последние элементы каждой ветки
+            max_branch_elem_index = i # Отслеживаем максимальный индекс элемента в ветках
+
+            for cond_idx, immediate_task_internal_id in branch_starts.items():
+                first_task_bpmn = element_map.get(immediate_task_internal_id)
+                if not first_task_bpmn: continue
+
+                condition_name = conditions[cond_idx] if elem_type == "exclusive_gateway" and cond_idx < len(conditions) else None
+
+                # 1. Поток: Расходящийся -> Первая задача ветки
+                add_flow(current_bpmn_id, first_task_bpmn["id"], condition_name)
+                first_task_index = element_indices_map.get(immediate_task_internal_id)
+                if first_task_index is not None:
+                    processed_element_indices.add(first_task_index)
+                    max_branch_elem_index = max(max_branch_elem_index, first_task_index)
+
+                # 2. Итеративный обход ветки (простой вариант: пока только первый элемент)
+                last_valid_element_in_branch_bpmn = first_task_bpmn
+                # TODO: Реализовать более сложный обход ветки при необходимости
+
+                branch_end_elements.append(last_valid_element_in_branch_bpmn["id"])
+
+            # 3. Соединяем концы веток со сходящимся шлюзом
+            for branch_end_id in branch_end_elements:
+                 add_flow(branch_end_id, converging_gateway_id)
+
+            # 4. Соединяем Сходящийся Шлюз со следующим элементом
+            next_elem_data = find_first_element_after(all_elements_data, max_branch_elem_index, ["task", "exclusive_gateway", "parallel_gateway"])
+            target_after_converging_id = element_map.get(next_elem_data["internal_id"], {}).get('id') if next_elem_data else end_event_id
+
+            if target_after_converging_id:
+                add_flow(converging_gateway_id, target_after_converging_id)
+                last_processed_bpmn_id = target_after_converging_id
+                # Помечаем следующий элемент как обработанный
+                if next_elem_data:
+                     next_index = element_indices_map.get(next_elem_data["internal_id"])
+                     if next_index is not None: processed_element_indices.add(next_index)
+
+            # Присваиваем дорожку сходящемуся шлюзу
+            conv_lane = get_lane_for_element({"type": "converging_gateway", "diverging_gw_internal_id": current_internal_id}, default_lane_id)
+            if conv_lane: converging_gateway["lane"] = conv_lane; lane_flow_nodes[conv_lane].append(converging_gateway_id)
+
+        # --- Обработка Обычных Задач (если их вход еще не создан) ---
+        elif i not in processed_element_indices:
+             # Ищем следующий элемент
+             next_elem_data = find_first_element_after(all_elements_data, i, ["task", "exclusive_gateway", "parallel_gateway"])
+             target_bpmn_id = element_map.get(next_elem_data["internal_id"], {}).get('id') if next_elem_data else end_event_id
+
+             # Соединяем текущий элемент со следующим (или концом)
+             if target_bpmn_id:
+                 add_flow(current_bpmn_id, target_bpmn_id)
+                 last_processed_bpmn_id = target_bpmn_id
+                 # Помечаем следующий элемент как обработанный
+                 if next_elem_data:
+                      next_index = element_indices_map.get(next_elem_data["internal_id"])
+                      if next_index is not None: processed_element_indices.add(next_index)
+
+
+    # --- 3.5 Обработка Циклов ---
+    print("Processing loops...")
+    for elem_data in all_elements_data:
+        if elem_data["type"] == "loop":
+            data = elem_data["data"]; target_task_internal_id = data.get("go_to"); source_bpmn_elem = None
+            marker_index = element_indices_map.get(elem_data["internal_id"])
+            if marker_index is None: continue
+            for k in range(marker_index - 1, -1, -1):
+                prev_elem_data = all_elements_data[k]
+                if prev_elem_data["type"] != "loop": source_bpmn_elem = element_map.get(prev_elem_data.get("internal_id")); break
+            target_bpmn_task = element_map.get(target_task_internal_id)
+            if source_bpmn_elem and target_bpmn_task: add_flow(source_bpmn_elem["id"], target_bpmn_task["id"], "Loop back")
+            else: print(f"{Fore.YELLOW}Warning: Could not create loop flow. Source: {source_bpmn_elem.get('id') if source_bpmn_elem else 'NotFound'}, Target: {target_bpmn_task.get('id') if target_bpmn_task else 'NotFound'}{Fore.RESET}")
+
+    # --- 3.6 Соединение "висячих" узлов с EndEvent ---
+    print("Connecting remaining dangling ends to End Event...")
+    # flow_sources = {flow['sourceRef'] for flow in semantic_sequence_flows} # Используем processed_sources
+    for node in semantic_flow_nodes:
+        node_id = node['id']; node_type = node['type']
+        if node_type in ["bpmn:StartEvent", "bpmn:EndEvent"]: continue
+        if node_id not in processed_sources: # Если у узла не было создано исходящего потока
+            # Исключаем сходящиеся шлюзы
+            is_converging_gateway = node_id in diverging_to_converging_map.values()
+            if not is_converging_gateway:
+                 print(f"  Connecting dangling node {node_id} ({node.get('name','')}, {node_type}) to End Event.")
+                 add_flow(node_id, end_event_id)
+
+    # --- Финальная чистка и обновление ---
+    for lane in semantic_lanes:
+        lane["flowNodeRef"] = lane_flow_nodes.get(lane["id"], [])
+
+
+    # --- 4. Генерация Визуальной Информации (BPMNDI) ---
+    # (Код раскладки оставлен без изменений)
+    print("Generating visual layout...")
+    node_levels = defaultdict(int); level_nodes = defaultdict(list); max_level = 0;
+    queue = [(start_event_id, 0)] if start_event_id else []; visited_for_layout = {start_event_id} if start_event_id else set();
+    if start_event_id: node_levels[start_event_id] = 0; level_nodes[0].append(start_event_id);
+    processed_edges_layout = set()
+
+    while queue:
+        current_id_layout, level_layout = queue.pop(0); max_level = max(max_level, level_layout);
+        out_flows = [f for f in semantic_sequence_flows if f['sourceRef'] == current_id_layout]
+        out_flows.sort(key=lambda f: f['targetRef'])
+
+        for flow_layout in out_flows:
+            target_id_layout = flow_layout['targetRef']; flow_tuple_layout = (flow_layout['sourceRef'], target_id_layout);
+            target_level_current = node_levels.get(target_id_layout, -1)
+            is_loop_edge = target_level_current != -1 and target_level_current <= level_layout
+            if is_loop_edge or flow_tuple_layout in processed_edges_layout: continue
+
+            new_level_layout = level_layout + 1
+            if target_id_layout not in visited_for_layout or new_level_layout > target_level_current:
+                if target_id_layout in visited_for_layout and target_level_current != -1:
+                    if target_id_layout in level_nodes.get(target_level_current,[]): level_nodes[target_level_current].remove(target_id_layout)
+                node_levels[target_id_layout] = new_level_layout
+                if target_id_layout not in level_nodes.get(new_level_layout, []): level_nodes[new_level_layout].append(target_id_layout)
+                if target_id_layout not in visited_for_layout:
+                     visited_for_layout.add(target_id_layout); queue.append((target_id_layout, new_level_layout))
+            processed_edges_layout.add(flow_tuple_layout)
+
+    unvisited_nodes = [n['id'] for n in semantic_flow_nodes if n['id'] not in node_levels]
+    nodes_processed_in_fallback = True
+    while unvisited_nodes and nodes_processed_in_fallback:
+        nodes_processed_in_fallback = False; remaining_nodes = []
+        for node_id in unvisited_nodes:
+            in_flows = [f for f in semantic_sequence_flows if f['targetRef'] == node_id]
+            pred_levels = [node_levels.get(f['sourceRef'], -1) for f in in_flows]
+            valid_pred_levels = [lvl for lvl in pred_levels if lvl != -1]
+            if valid_pred_levels:
+                node_level = max(valid_pred_levels) + 1; node_levels[node_id] = node_level;
+                if node_id not in level_nodes.get(node_level, []): level_nodes[node_level].append(node_id)
+                max_level = max(max_level, node_level); nodes_processed_in_fallback = True;
             else:
-                 print(f"Warning: Could not nest gateway {gateway.get('id')} into parent {parent_id} path {parent_path_idx}. Parent structure invalid.")
+                if node_id == end_event_id and not in_flows:
+                    node_level = 1; node_levels[node_id] = node_level;
+                    if node_id not in level_nodes.get(node_level, []): level_nodes[node_level].append(node_id)
+                    max_level = max(max_level, node_level); nodes_processed_in_fallback = True;
+                elif node_id != start_event_id: remaining_nodes.append(node_id)
+        unvisited_nodes = remaining_nodes
+        if not nodes_processed_in_fallback and unvisited_nodes:
+             print(f"{Fore.YELLOW}Warning: Could not determine level for nodes: {unvisited_nodes}. Layout might be incorrect.{Fore.RESET}")
+             fallback_level = max_level + 1
+             for node_id in unvisited_nodes:
+                 node_levels[node_id] = fallback_level
+                 if node_id not in level_nodes.get(fallback_level, []): level_nodes[fallback_level].append(node_id)
+             max_level = fallback_level; break
 
-    # Затем обрабатываем вложенность на основе координат для тех, у кого нет явного родителя
-    # Идем в обратном порядке (от меньших к большим), чтобы вложить внутренние первыми
-    sorted_gateways = sorted(all_gateways, key=calculate_distance)
+    element_dims = {}; element_coords = {};
+    for element in semantic_flow_nodes:
+        elem_id = element["id"]; elem_type = element["type"]; width = DEFAULT_WIDTH; height = DEFAULT_HEIGHT;
+        if "Event" in elem_type: width = EVENT_WIDTH; height = EVENT_HEIGHT;
+        elif "Gateway" in elem_type: width = GATEWAY_WIDTH; height = GATEWAY_HEIGHT;
+        element_dims[elem_id] = (width, height)
 
-    for i, inner_gw in enumerate(sorted_gateways):
-        inner_id = inner_gw.get("id")
-        # Пропускаем уже вложенные по явной ссылке
-        if inner_id in nested_ids:
-            continue
+    level_start_x = {}; current_x = POOL_PADDING_X + LANE_HEADER_WIDTH + HORIZONTAL_SPACING // 2
+    for level in range(max_level + 1):
+        level_start_x[level] = current_x; max_w_on_level = 0;
+        nodes_on_this_level = level_nodes.get(level, [])
+        valid_nodes_on_level = [nid for nid in nodes_on_this_level if nid in element_dims]
+        if valid_nodes_on_level: max_w_on_level = max(element_dims[nid][0] for nid in valid_nodes_on_level);
+        current_x += max(max_w_on_level, GATEWAY_WIDTH) + HORIZONTAL_SPACING
+    max_diagram_width = current_x + POOL_PADDING_X
 
-        best_parent = None
-        best_parent_path_idx = -1
-        min_parent_distance = float('inf')
+    lane_y_current = {}; lane_heights = {}; initial_lane_y_starts = {};
+    current_y_offset = POOL_PADDING_Y
+    for lane in semantic_lanes:
+        lane_id = lane['id']; initial_lane_y_starts[lane_id] = current_y_offset; lane_y_current[lane_id] = current_y_offset + LANE_PADDING_Y; lane_heights[lane_id] = LANE_MIN_HEIGHT; current_y_offset += lane_heights[lane_id];
 
-        # Ищем наименьший подходящий родительский шлюз среди оставшихся
-        for j, outer_gw in enumerate(sorted_gateways):
-            outer_id = outer_gw.get("id")
-            # Не вкладываем в себя и не вкладываем в уже вложенные шлюзы
-            if i == j or outer_id in nested_ids:
-                continue
+    processed_layout_nodes = set()
+    all_levels = sorted(level_nodes.keys())
+    for level in all_levels:
+        nodes_in_level = level_nodes.get(level, []); nodes_by_lane = defaultdict(list);
+        for node_id in nodes_in_level:
+             node_info = find_element_by_bpmn_id(semantic_flow_nodes, node_id)
+             if node_info:
+                  lane_id = node_info.get('lane')
+                  if lane_id: nodes_by_lane[lane_id].append(node_id)
 
-            outer_paths = outer_gw.get("paths", [])
-            outer_children = outer_gw.get("children") # Нужны children для вставки
+        for lane_id, node_ids_in_lane in nodes_by_lane.items():
+            node_ids_in_lane.sort()
+            base_y_for_level = lane_y_current.get(lane_id, initial_lane_y_starts.get(lane_id, POOL_PADDING_Y) + LANE_PADDING_Y)
+            current_level_max_y = base_y_for_level
 
-            # Проверяем вложение по координатам и размеру
-            # is_nested проверяет start/end шлюза, а не пути!
-            if is_nested(inner_gw, outer_gw):
-                 current_distance = calculate_distance(outer_gw)
-                 # Ищем самый "маленький" (наиболее близкий по размеру) родитель
-                 if current_distance < min_parent_distance:
-                     # Теперь ищем, в какой *путь* родителя вложить
-                     path_found = False
-                     for path_idx, path in enumerate(outer_paths):
-                         # Проверяем, попадает ли начало внутреннего шлюза в путь родителя
-                         if path.get("start") is not None and path.get("end") is not None and \
-                            path["start"] <= inner_gw.get("start", -1) < path["end"] + 1:
-                             best_parent = outer_gw
-                             best_parent_path_idx = path_idx
-                             min_parent_distance = current_distance
-                             path_found = True
-                             break # Нашли подходящий путь
-                     # if not path_found: # Не нашли путь, куда вложить (странно)
-                     #     print(f"Warning: Gateway {inner_id} seems nested in {outer_id}, but not within any specific path.")
+            for node_id in node_ids_in_lane:
+                  if node_id in processed_layout_nodes: continue
+                  if node_id not in element_dims: continue
 
-        # Если нашли родителя
-        if best_parent and best_parent_path_idx != -1:
-            # Убедимся, что у родителя есть 'children' и нужный индекс пути
-            if "children" in best_parent and 0 <= best_parent_path_idx < len(best_parent["children"]):
-                target_path_children = best_parent["children"][best_parent_path_idx]
-                insert_in_sorted_order(target_path_children, inner_gw)
-                nested_ids.add(inner_id) # Помечаем как вложенный
+                  node_level = node_levels.get(node_id, level)
+                  x = level_start_x.get(node_level, POOL_PADDING_X)
+                  width, height = element_dims[node_id]
+                  y = base_y_for_level
+
+                  center_x = x
+                  final_x = center_x - width // 2
+
+                  element_coords[node_id] = {"x": final_x, "y": y, "width": width, "height": height}
+                  processed_layout_nodes.add(node_id)
+                  base_y_for_level += height + VERTICAL_SPACING
+                  current_level_max_y = max(current_level_max_y, y + height)
+
+            if node_ids_in_lane:
+                 lane_y_current[lane_id] = base_y_for_level
+                 required_height = (current_level_max_y - initial_lane_y_starts.get(lane_id, 0)) + LANE_PADDING_Y
+                 lane_heights[lane_id] = max(lane_heights.get(lane_id, 0), required_height, LANE_MIN_HEIGHT)
+
+    lane_y_positions = {}; current_y = POOL_PADDING_Y; max_pool_height = POOL_PADDING_Y;
+    for lane in semantic_lanes:
+        lane_id = lane['id']; final_lane_height = lane_heights.get(lane_id, LANE_MIN_HEIGHT); lane_y_positions[lane_id] = current_y; current_y += final_lane_height;
+    max_pool_height = current_y
+
+    visual_shapes = []
+    pool_width = max_diagram_width - POOL_PADDING_X
+    pool_height = max_pool_height - POOL_PADDING_Y
+    visual_shapes.append({ "id": generate_unique_id("Shape_Participant"), "bpmnElement": main_pool_id, "isHorizontal": True, "isExpanded": True, "bounds": {"x": POOL_PADDING_X, "y": POOL_PADDING_Y, "width": pool_width, "height": pool_height} })
+    lane_width = pool_width - LANE_HEADER_WIDTH
+    for lane in semantic_lanes:
+        lane_id = lane['id']; lane_height = lane_heights.get(lane_id, LANE_MIN_HEIGHT); lane_y = lane_y_positions.get(lane_id, POOL_PADDING_Y);
+        visual_shapes.append({ "id": generate_unique_id("Shape_Lane"), "bpmnElement": lane_id, "isHorizontal": True, "bounds": {"x": POOL_PADDING_X + LANE_HEADER_WIDTH, "y": lane_y, "width": lane_width, "height": lane_height} })
+    for node in semantic_flow_nodes:
+         node_id = node['id'];
+         if node_id in element_coords: visual_shapes.append({"id": generate_unique_id(f"Shape_{node_id}"), "bpmnElement": node_id, "bounds": element_coords[node_id]})
+         else: print(f"{Fore.YELLOW}Warning: Node {node_id} ('{node.get('name','')}') lacks coordinates. Shape will not be generated.{Fore.RESET}")
+
+    print("Creating visual edges...")
+    visual_edges = []
+    for flow in semantic_sequence_flows:
+        flow_id = flow["id"]; source_id = flow["sourceRef"]; target_id = flow["targetRef"]; source_coords = element_coords.get(source_id); target_coords = element_coords.get(target_id); waypoints = []
+        if source_coords and target_coords:
+            cx_source, cy_source = get_element_center(source_coords).values(); cx_target, cy_target = get_element_center(target_coords).values(); source_level = node_levels.get(source_id, -1); target_level = node_levels.get(target_id, -1);
+            start_point = {"x": source_coords["x"] + source_coords["width"], "y": cy_source}; end_point = {"x": target_coords["x"], "y": cy_target};
+            is_loop_back = target_level < source_level and target_level != -1; is_vertical_in_level = target_level == source_level and source_level != -1 and source_id != target_id;
+
+            if is_loop_back:
+                 start_point = {"x": cx_source, "y": source_coords["y"] + source_coords["height"]}; end_point = {"x": cx_target, "y": target_coords["y"]};
+                 waypoints.append(start_point); mid_y = max(start_point['y'], end_point['y'] + target_coords["height"]) + VERTICAL_SPACING // 2; h_offset = GATEWAY_WIDTH + 20;
+                 waypoints.append({"x": start_point["x"], "y": mid_y}); waypoints.append({"x": end_point["x"] - h_offset, "y": mid_y}); waypoints.append({"x": end_point["x"] - h_offset, "y": end_point["y"]}); waypoints.append(end_point)
+            elif is_vertical_in_level:
+                 if cy_target > cy_source: start_point = {"x": cx_source, "y": source_coords["y"] + source_coords["height"]}; end_point = {"x": cx_target, "y": target_coords["y"]};
+                 else: start_point = {"x": cx_source, "y": source_coords["y"]}; end_point = {"x": cx_target, "y": target_coords["y"] + target_coords["height"]};
+                 waypoints.append(start_point); mid_x_offset = (DEFAULT_WIDTH + HORIZONTAL_SPACING) // 4; mid_x = max(source_coords["x"]+source_coords["width"], target_coords["x"]+target_coords["width"]) + mid_x_offset;
+                 waypoints.append({"x": mid_x, "y": start_point["y"]}); waypoints.append({"x": mid_x, "y": end_point["y"]}); waypoints.append(end_point)
             else:
-                 print(f"Warning: Could not nest gateway {inner_id} into parent {best_parent.get('id')} path {best_parent_path_idx} based on coordinates. Parent structure invalid.")
+                 waypoints.append(start_point);
+                 if abs(start_point["y"] - end_point["y"]) > 5:
+                     mid_x = (start_point["x"] + end_point["x"]) // 2; mid_x = max(start_point["x"] + 10, mid_x); mid_x = min(end_point["x"] - 10, mid_x);
+                     waypoints.append({"x": mid_x, "y": start_point["y"]}); waypoints.append({"x": mid_x, "y": end_point["y"]});
+                 waypoints.append(end_point);
 
+            edge_data = {"id": generate_unique_id(f"Edge_{flow_id}"), "bpmnElement": flow_id, "waypoints": waypoints}
+            flow_name = flow.get("name")
+            if flow_name:
+                 label_x = waypoints[len(waypoints)//2]["x"] + 10; label_y = waypoints[len(waypoints)//2]["y"] - 10; label_width = max(50, len(flow_name) * 7)
+                 edge_data["label"] = { "bounds": { "x": label_x, "y": label_y, "width": label_width, "height": 14 } }
+            visual_edges.append(edge_data)
+        else: print(f"{Fore.YELLOW}Warning: Missing coords for flow {flow_id} (Source: {source_id} {'OK' if source_coords else 'MISSING'}, Target: {target_id} {'OK' if target_coords else 'MISSING'}). Skipping edge generation.{Fore.RESET}")
 
-    # Возвращаем только шлюзы верхнего уровня (те, что не были вложены)
-    top_level_gateways = [gw for gw in all_gateways if gw.get("id") not in nested_ids]
+    # --- 5. Сборка финального JSON ---
+    print("Assembling final JSON...")
+    final_json = {
+        "definitions": {
+            "id": definitions_id, "targetNamespace": "http://bpmn.io/schema/bpmn", "exporter": "Python BPMN Generator", "exporterVersion": "0.13", # Версия
+            "collaboration": {"id": collaboration_id, "participants": semantic_participants},
+            "process": {
+                "id": process_id, "isExecutable": False, "name": process_id, **({"laneSets": semantic_lane_sets} if process_has_laneset else {}),
+                "flowElements": semantic_flow_nodes, "sequenceFlows": semantic_sequence_flows
+            }
+        },
+        "diagrams": [{"id": diagram_id, "plane": {"id": plane_id, "bpmnElement": collaboration_id, "planeElement": visual_shapes + visual_edges}}]
+    }
 
-    return top_level_gateways
+    print(f"{Fore.GREEN}BPMN JSON structure created successfully.{Fore.RESET}")
+    return final_json
 
-
-def insert_in_sorted_order(children: list, element_to_insert: dict):
-    """
-    Inserts an element into a list of children, maintaining sort order by start index.
-    Args:
-        children (list): The list of child elements (tasks, loops, gateways).
-        element_to_insert (dict): The element to insert.
-    """
-    insert_start_idx = get_start_idx(element_to_insert)
-    if insert_start_idx is None:
-        # Если не можем определить начало, добавляем в конец
-        children.append(element_to_insert)
-        return
-
-    index = 0
-    while index < len(children):
-        child_start_idx = get_start_idx(children[index])
-        # Если у ребенка нет индекса или начало вставляемого элемента меньше
-        if child_start_idx is None or insert_start_idx < child_start_idx:
-            break # Нашли позицию для вставки
-        index += 1
-    children.insert(index, element_to_insert)
-
-
-# --- Функция ranges_overlap_percentage БЕЗ ИЗМЕНЕНИЙ ---
-def ranges_overlap_percentage(
-    range1: tuple[int, int], range2: tuple[int, int], min_overlap_percentage=0.97
-) -> bool:
-    """
-    Determines if two ranges overlap by a certain percentage. Each range is a tuple of the form (start, end).
-    Args:
-        range1 (tuple): The first range.
-        range2 (tuple): The second range.
-        min_overlap_percentage (float): The minimum percentage of overlap required for the ranges to be considered overlapping.
-    Returns:
-        bool: True if the ranges overlap by the minimum percentage, False otherwise.
-    """
-    start1, end1 = range1
-    start2, end2 = range2
-
-    # Проверка на валидность диапазонов
-    if start1 >= end1 or start2 >= end2:
-        return False # Диапазон нулевой или отрицательной длины
-
-    overlap_start = max(start1, start2)
-    overlap_end = min(end1, end2)
-
-    # Есть ли пересечение?
-    if overlap_start < overlap_end:
-        overlap_range = overlap_end - overlap_start
-        range1_size = end1 - start1
-        range2_size = end2 - start2
-
-        # Избегаем деления на ноль (хотя уже проверили start < end)
-        if range1_size == 0 or range2_size == 0:
-             return False
-
-        overlap_percentage1 = overlap_range / range1_size
-        overlap_percentage2 = overlap_range / range2_size
-
-        # Проверяем, что ОБА процента перекрытия удовлетворяют порогу
-        return (
-            overlap_percentage1 >= min_overlap_percentage
-            and overlap_percentage2 >= min_overlap_percentage
-        )
-    else:
-        # Нет пересечения
-        return False
-
-
-# --- Блок __main__ остается для тестирования ---
-# Он будет читать JSON с новой структурой agent_task_pairs,
-# и код выше должен его корректно обработать.
-if __name__ == "__main__":
-    import json
-    from os.path import exists
-
-    # Определяем пути к файлам логов
-    log_dir = "output_logs"
-    structure_dir = "bpmn_structure"
-    atp_final_file = f"{log_dir}/agent_task_pairs_final.json"
-    proc_info_file = f"{log_dir}/process_info_entities_classified.json" # Используем классифицированные
-    pg_data_file = f"{log_dir}/parallel_gateway_data.json"
-    eg_data_file = f"{log_dir}/exclusive_gateway_data.json"
-    output_file = f"{structure_dir}/bpmn_final_structure.json" # Имя финального файла
-
-    # Инициализируем переменные
-    agent_task_pairs = []
-    parallel_gateway_data = []
-    exclusive_gateway_data = []
-    process_info = []
-
-    # Загружаем данные из файлов логов, если они существуют
-    if exists(atp_final_file):
-        try:
-            with open(atp_final_file, "r", encoding='utf-8') as file: # Добавил encoding
-                agent_task_pairs = json.load(file)
-            print(f"Loaded {len(agent_task_pairs)} items from {atp_final_file}")
-        except Exception as e:
-            print(f"Error loading {atp_final_file}: {e}")
-    else:
-        print(f"File not found: {atp_final_file}")
-
-
-    if exists(proc_info_file):
-         try:
-             with open(proc_info_file, "r", encoding='utf-8') as file:
-                 process_info = json.load(file)
-             print(f"Loaded {len(process_info)} items from {proc_info_file}")
-         except Exception as e:
-             print(f"Error loading {proc_info_file}: {e}")
-    # else: # Отсутствие process_info может быть нормальным
-    #     print(f"File not found: {proc_info_file}")
-
-
-    if exists(pg_data_file):
-        try:
-            with open(pg_data_file, "r", encoding='utf-8') as file:
-                parallel_gateway_data = json.load(file)
-            print(f"Loaded {len(parallel_gateway_data)} items from {pg_data_file}")
-        except Exception as e:
-            print(f"Error loading {pg_data_file}: {e}")
-    # else: # Отсутствие параллельных шлюзов - норма
-    #     print(f"File not found: {pg_data_file}")
-
-
-    if exists(eg_data_file):
-        try:
-            with open(eg_data_file, "r", encoding='utf-8') as file:
-                exclusive_gateway_data = json.load(file)
-            print(f"Loaded {len(exclusive_gateway_data)} items from {eg_data_file}")
-        except Exception as e:
-            print(f"Error loading {eg_data_file}: {e}")
-    # else: # Отсутствие эксклюзивных шлюзов - норма
-    #     print(f"File not found: {eg_data_file}")
-
-    # Проверяем, есть ли хотя бы пары агент-задача для обработки
-    if not agent_task_pairs and not parallel_gateway_data and not exclusive_gateway_data:
-         print("No input data found to create BPMN structure. Exiting.")
-    else:
-        print("\nRunning create_bpmn_structure...")
-        # Вызываем основную функцию
-        final_structure = create_bpmn_structure(
-            agent_task_pairs, parallel_gateway_data, exclusive_gateway_data, process_info
-        )
-
-        # Проверяем результат и записываем в файл
-        if final_structure is not None:
-            # Создаем директорию для структуры, если ее нет
-            import os
-            if not os.path.exists(structure_dir):
-                os.makedirs(structure_dir)
-            # Записываем финальную структуру
-            write_to_file(output_file, final_structure)
-            print(f"\nFinal BPMN structure saved to {output_file}")
-        else:
-            print("\nFailed to create BPMN structure.")
+# --- END OF FILE create_bpmn_structure.py ---

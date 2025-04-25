@@ -1,584 +1,422 @@
+# --- START OF FILE deepseek_prompts.py ---
+import json
+import re
+
 import torch
 from transformers import AutoTokenizer, AutoModelForCausalLM, GenerationConfig
+import traceback
+from colorama import Fore, init # Для цветного вывода предупреждений
 
-tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/deepseek-llm-7b-chat", trust_remote_code=True)
-model = AutoModelForCausalLM.from_pretrained("deepseek-ai/deepseek-llm-7b-chat", trust_remote_code=True, torch_dtype=torch.float16)
-model.eval()
-DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model.to(DEVICE)
+init(autoreset=True)
 
-SYSTEM_MSG = ("You are a highly experienced business process modelling expert, specializing in BPMN modelling. "
-              "You will be provided with a description of a complex business process and will need to answer questions regarding the process."
-              " Your answers should be clear, accurate and concise.")
+# --- Инициализация Модели ---
+model_loaded = False
+tokenizer = None
+model = None
+DEVICE = "cpu"
+try:
+    tokenizer = AutoTokenizer.from_pretrained("deepseek-ai/deepseek-llm-7b-chat", trust_remote_code=True)
+    model = AutoModelForCausalLM.from_pretrained("deepseek-ai/deepseek-llm-7b-chat", trust_remote_code=True, torch_dtype=torch.bfloat16)
+    model.generation_config = GenerationConfig.from_pretrained("deepseek-ai/deepseek-llm-7b-chat", trust_remote_code=True)
+    model.generation_config.pad_token_id = model.generation_config.eos_token_id
+
+    model.eval()
+    DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model.to(DEVICE)
+    print(f"DeepSeek model loaded successfully on {DEVICE}.")
+    model_loaded = True
+except Exception as e:
+    print(f"{Fore.RED}Error loading DeepSeek model: {e}{Fore.RESET}")
+    print(f"{Fore.YELLOW}LLM prompts will return default values or empty strings.{Fore.RESET}")
+
+# --- Системные сообщения ---
+SYSTEM_MSG_BPMN_EXPERT = ("You are a highly experienced business process modelling expert, specializing in BPMN modelling. "
+                          "You will be provided with descriptions of business processes or parts of them. "
+                          "Your answers must be accurate, concise, and strictly follow the requested format.")
+
+# --- Вспомогательная функция для генерации ---
+def _generate_llm_response(messages: list, max_new_tokens: int, temperature: float = 0.0) -> str:
+    """Вспомогательная функция для генерации ответа LLM с обработкой ошибок."""
+    if not model_loaded:
+        print(f"{Fore.YELLOW}Warning: LLM model not loaded. Returning empty string.{Fore.RESET}")
+        return "" # Заглушка
+
+    try:
+        prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        # Ограничиваем длину входного промпта
+        inputs = tokenizer(prompt, return_tensors="pt", max_length=3072, truncation=True).to(DEVICE) # Увеличим немного max_length
+
+        with torch.no_grad():
+            outputs = model.generate(
+                **inputs,
+                max_new_tokens=max_new_tokens,
+                temperature=temperature,
+                do_sample=(temperature > 0.0),
+            )
+
+        decoded_outputs = tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        if not decoded_outputs: return ""
+
+        # Более надежное извлечение ответа модели
+        # Ищем последний 'assistant\n' или подобный маркер конца промпта
+        prompt_end_marker = "assistant\n" # Стандартный маркер для chat template
+        response_start_index = decoded_outputs[0].rfind(prompt_end_marker)
+        if response_start_index != -1:
+             response_part = decoded_outputs[0][response_start_index + len(prompt_end_marker):].strip()
+        else:
+             # Если маркер не найден (менее вероятно), пытаемся отрезать исходный user prompt
+             last_user_message = messages[-1]['content']
+             response_part = decoded_outputs[0].split(last_user_message)[-1].strip()
+
+        return response_part
+
+    except Exception as e:
+        print(f"{Fore.RED}Error during LLM generation: {e}{Fore.RESET}")
+        traceback.print_exc()
+        return ""
+
+# --- Основные функции промптов ---
+
+def suggest_gateway_name(gateway_text: str) -> str:
+    """
+    Предлагает короткое, вопросительное (если применимо) имя для шлюза.
+    """
+    if not model_loaded: return "Gateway" # Заглушка
+
+    cleaned_text = ' '.join(gateway_text.split())
+    max_input_length = 512
+    if len(cleaned_text) > max_input_length: cleaned_text = cleaned_text[:max_input_length] + "..."
+
+    system_prompt = (
+        "You are a BPMN expert. Given text describing conditions, decisions, or parallel actions at a gateway, "
+        "suggest a concise, meaningful name (2-5 words). If it's a decision, end with '?'. "
+        "If it's parallel execution, use a verb phrase. Output ONLY the suggested name."
+    )
+    user_prompt = (
+        "Text: 'If the customer chooses to finance... If the customer chooses to pay in cash...'\n"
+        "Name: Payment Method?\n\n"
+        "Text: 'If the item is in stock... If the item is out of stock...'\n"
+        "Name: Item in Stock?\n\n"
+        "Text: 'If the design is approved... If not...'\n"
+        "Name: Design Approved?\n\n"
+        "Text: 'one team verifies employment while another verifies income simultaneously.'\n"
+        "Name: Verify Applicant Info\n\n" # Изменен пример
+        "Text: 'Send mail while preparing documents.'\n"
+        "Name: Send Mail & Prepare Docs\n\n" # Добавлен пример
+        f"Text: '{cleaned_text}'\n"
+        "Name:"
+    )
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    response = _generate_llm_response(messages, max_new_tokens=15, temperature=0.1)
+    response = response.split('\n')[0].strip().replace('"', '')
+
+    # Пост-обработка для добавления '?' (можно улучшить логику)
+    decision_keywords = ["if", "whether", "choose", "decide", "option", "case"]
+    if any(keyword in gateway_text.lower() for keyword in decision_keywords) and "?" not in response:
+        if not response.endswith('?'): response += '?'
+
+    return response if response else "Gateway"
+
 
 def extract_exclusive_gateways(process_description: str) -> str:
     """
-    Извлекает текст задач, следующих из условий указанного exclusive gateway,
-    включая не-непосредственные задачи.
+    Извлекает текст, относящийся к эксклюзивным шлюзам.
     """
     system_msg = (
-        "You are a highly experienced business process modelling expert, "
-        "specializing in BPMN modelling. You will be provided with a description of a complex business process "
-        "and will need to extract the text which belongs to a specific exclusive gateway. "
-        "You have to extract all the tasks that follow from the conditions in the exclusive gateway, not only the immediate tasks."
+        "You are a BPMN expert. Extract the text spans belonging to **exclusive** decision points (gateways) from the process description. "
+        "These often start with 'if', 'whether', 'depending on', 'case'. Include all conditional paths originating from that single decision point. "
+        "Format the output strictly as:\nExclusive gateway 1: <text span for gateway 1>\nExclusive gateway 2: <text span for gateway 2>\n... Output ONLY this structure."
     )
-
     user_msg = (
-        "Process: 'If the client opts for funding, they will have to complete a loan request. Then, the client submits the application to the financial institution. "
-        "If the client decides to pay with currency, they will need to bring the full amount of the vehicle's cost to the dealership to finalize the purchase.'\n"
-        "Exclusive gateway 1: If the client opts for funding, they will have to complete a loan request. Then, the client submits the application to the financial institution. "
-        "If the client decides to pay with currency, they will need to bring the full amount of the vehicle's cost to the dealership to finalize the purchase.\n\n"
-        "Process: 'If the customer chooses to finance, the customer will need to fill out a loan application. If the customer chooses to pay in cash, the customer will need to bring the total cost of the car to the dealership in order to complete the transaction. "
-        "After the financial decision has been made, if the customer decides to trade in their old car, the dealership will provide an appraisal and deduct the value from the total cost of the new car. However, if the customer chooses not to trade in their old car, they will need to pay the full price of the new car.'\n"
-        "Exclusive gateway 1: If the customer chooses to finance, the customer will need to fill out a loan application. If the customer chooses to pay in cash, the customer will need to bring the total cost of the car to the dealership in order to complete the transaction.\n"
-        "Exclusive gateway 2: if the customer decides to trade in their old car, the dealership will provide an appraisal and deduct the value from the total cost of the new car. However, if the customer chooses not to trade in their old car, they will need to pay the full price of the new car.\n\n"
-        "Process: 'If the student scores below 60%, he takes the exam again. If the student scores 60% or higher on the exam, the professor enters the grade.'\n"
-        "Exclusive gateway 1: If the student scores below 60%, he takes the exam again. If the student scores 60% or higher on the exam, the professor enters the grade.\n\n"
-        "Process: 'If the company chooses to create a new product, the company designs the product. If the company is satisfied with the design, the company launches the product and the process ends. "
-        "If not, the company redesigns the product. On the other hand, if the company chooses to modify an existing product, the company chooses a product to redesign and then redesigns the product.'\n"
-        "Exclusive gateway 1: If the company chooses to create a new product, the company designs the product. If the company is satisfied with the design, the company launches the product and the process ends. If not, the company redesigns the product. "
-        "On the other hand, if the company chooses to modify an existing product, the company chooses a product to redesign and then redesigns the product.\n"
-        "Exclusive gateway 2: If the company is satisfied with the design, the company launches the product and the process ends. If not, the company redesigns the product.\n\n"
-        "Process: 'if approved, the client finalizes their project.'\n"
-        "Exclusive gateway 1: if approved, the client finalizes their project.\n\n"
-        "Process: 'If the student is rejected, the employer notifies the student. If the student is accepted, the professor notifies the student via email and Slack in parallel. "
-        "The student then fills out the application form. The student hands in his internship journal. Finally, the professor updates the Airtable database and the process ends.'\n"
-        "Exclusive gateway 1: If the student is rejected, the employer notifies the student. If the student is accepted, the professor notifies the student via email and Slack in parallel. The student then fills out the application form. "
-        "The student hands in his internship journal. Finally, the professor updates the Airtable database and the process ends.\n\n"
-        f"Process: '{process_description}'\n"
-        "Exclusive gateway 1:"
+        # Примеры (можно проверить/дополнить)
+        "Process: 'If the client opts for funding, complete a loan request then submit application. If the client pays cash, bring the full amount.'\n"
+        "Exclusive gateway 1: If the client opts for funding, complete a loan request then submit application. If the client pays cash, bring the full amount.\n\n"
+        "Process: 'Check inventory. If item is in stock, check payment. If item is out of stock, notify customer. Then, if payment authorized, confirm order. If payment declined, notify customer.'\n"
+        "Exclusive gateway 1: If item is in stock, check payment. If item is out of stock, notify customer.\n"
+        "Exclusive gateway 2: if payment authorized, confirm order. If payment declined, notify customer.\n\n"
+        f"Process: '{process_description}'"
     )
-
-    # Формируем финальный промпт
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg}
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Токенизируем промпт
-    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Получаем только сгенерированную часть
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return generated_text[len(prompt):].strip()
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    return _generate_llm_response(messages, max_new_tokens=512)
 
 
 def extract_exclusive_gateways_2_conditions(process_description: str) -> str:
     """
-    Извлекает задачи для указанного exclusive gateway по двум условиям,
-    включая не-непосредственные задачи, используя deepseek-llm-7b-chat.
+    Извлекает текст для exclusive gateway с ровно двумя условиями.
     """
-    # Системное сообщение — общая инструкция
     system_msg = (
-        "You are a highly experienced business process modelling expert, specializing in BPMN modelling. "
-        "Extract the text belonging to a specific exclusive gateway, including all tasks that follow the gateway conditions."
+        "You are a BPMN expert. From the process description, extract the single text span covering an exclusive decision point (gateway) that has exactly **two** conditional paths (e.g., if/else, option A/option B). "
+        "Include the complete text for both paths starting from the condition. "
+        "Format the output strictly as:\nExclusive gateway 1: <text span containing both paths>"
     )
-
-    # Примеры и описание задачи
     user_msg = (
-        "You will receive a description of a process which contains conditions. "
-        "Extract the text which belongs to a specific exclusive gateway. "
-        "You have to extract all the tasks that follow from the conditions in the exclusive gateway, not only the immediate tasks.\n\n###\n\n"
-
-        "Process: 'If the client opts for funding, they will have to complete a loan request. Then, the client submits the application to the financial institution. "
-        "If the client decides to pay with currency, they will need to bring the full amount of the vehicle's cost to the dealership to finalize the purchase. "
-        "Once the client has chosen to fund or pay with currency, they must sign the agreement before concluding the transaction.'\n"
-        "Exclusive gateway 1: If the client opts for funding, they will have to complete a loan request. Then, the client submits the application to the financial institution. "
-        "If the client decides to pay with currency, they will need to bring the full amount of the vehicle's cost to the dealership to finalize the purchase.\n\n"
-
-        "Process: 'If the student scores below 60%, he takes the exam again. If the student scores 60% or higher on the exam, the professor enters the grade.'\n"
-        "Exclusive gateway 1: If the student scores below 60%, he takes the exam again. If the student scores 60% or higher on the exam, the professor enters the grade.\n\n"
-
-        "Process: 'If yes, the manager prepares additional questions. If the decision is not to prepare, the manager waits for the customer. "
-        "After the paths merge, the customer sends the application.'\n"
-        "Exclusive gateway 1: If yes, the manager prepares additional questions. "
-        "If the decision is not to prepare, the manager waits for the customer.\n\n"
-
-        "Process: 'If the student is rejected, the employer notifies the student. If the student is accepted, the professor notifies the student via email and Slack in parallel. "
-        "The student then fills out the application form. The student hands in his internship journal. Finally, the professor updates the Airtable database and the process ends.'\n"
-        "Exclusive gateway 1: If the student is rejected, the employer notifies the student. If the student is accepted, the professor notifies the student via email and Slack in parallel. "
-        "The student then fills out the application form. The student hands in his internship journal. Finally, the professor updates the Airtable database and the process ends.\n\n"
-
-        f"Process: '{process_description}'\n"
-        "Exclusive gateway 1:"
+        # Примеры...
+        "Process: 'If score < 60%, retake exam. Else (score >= 60%), enter grade.'\n"
+        "Exclusive gateway 1: If score < 60%, retake exam. Else (score >= 60%), enter grade.\n\n"
+        "Process: 'Check application. If complete, process it. If incomplete, request more info.'\n"
+        "Exclusive gateway 1: If complete, process it. If incomplete, request more info.\n\n"
+        f"Process: '{process_description}'"
     )
-
-    # Собираем prompt через шаблон
-    messages = [
-        {"role": "system", "content": system_msg},
-        {"role": "user", "content": user_msg}
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Токенизируем
-    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-
-    # Генерация
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Получаем только ответ
-    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    return generated_text[len(prompt):].strip()
+    messages = [{"role": "system", "content": system_msg}, {"role": "user", "content": user_msg}]
+    return _generate_llm_response(messages, max_new_tokens=384)
 
 
-
-def extract_gateway_conditions(process_description: str, conditions: str) -> str:
-    """
-    Группирует условия по exclusive gateway'ам, используя deepseek-llm-7b-chat.
-    Используются только переданные условия.
-    """
-    # Системный prompt
-    system_prompt = (
-        "You are an expert in business process modeling. You will be given a process description and a list of conditions. "
-        "Your task is to group the conditions by the exclusive gateways they belong to. Only use the listed conditions. "
-        "Format your answer like:\nExclusive gateway 1: <cond1> || <cond2>\nExclusive gateway 2: <cond3> || <cond4>\n..."
-    )
-
-    # Пользовательский prompt с примерами
-    user_prompt = (
-        "You will receive a description of a process and a list of conditions that appear in the process. "
-        "Determine which conditions belong to which exclusive gateway. Use only the conditions that are listed, "
-        "do not take anything else from the process description.\n\n###\n\n"
-
-        "Process: 'The customer decides if he wants to finance or pay in cash. If the customer chooses to finance, "
-        "the customer will need to fill out a loan application. If the customer chooses to pay in cash, the customer "
-        "will need to bring the total cost of the car to the dealership in order to complete the transaction.'\n"
-        "Conditions: 'If the customer chooses to finance', 'If the customer chooses to pay in cash'\n"
-        "Exclusive gateway 1: If the customer chooses to finance || If the customer chooses to pay in cash\n\n"
-
-        "Process: 'The restaurant receives the food order from the customer. If the dish is not available, the customer is informed "
-        "that the order cannot be fulfilled. If the dish is available and the payment is successful, the restaurant prepares and serves the order. "
-        "If the dish is available, but the payment fails, the customer is notified that the order cannot be processed.'\n"
-        "Conditions: 'If the dish is not available', 'If the dish is available and the payment is successful', 'If the dish is available, but the payment fails'\n"
-        "Exclusive gateway 1: If the dish is not available || If the dish is available and the payment is successful || If the dish is available, but the payment fails\n\n"
-
-        "Process: 'The customer places an order on the website. The system checks the inventory status of the ordered item. "
-        "If the item is in stock, the system checks the customer's payment information. If the item is out of stock, the system sends an out of stock notification "
-        "to the customer and cancels the order. After checking the customer's payment info, if the payment is authorized, the system generates an order confirmation and sends it "
-        "to the customer, and the order is sent to the warehouse for shipping. If the payment is declined, the system sends a payment declined notification to the customer and cancels the order.'\n"
-        "Conditions: 'If the item is in stock', 'If the item is out of stock', 'if the payment is authorized', 'If the payment is declined'\n"
-        "Exclusive gateway 1: If the item is in stock || If the item is out of stock\n"
-        "Exclusive gateway 2: if the payment is authorized || If the payment is declined\n\n"
-
-        "Process: 'The process begins with the student choosing his preferences. Then the professor allocates the student. After that the professor notifies the student. "
-        "The employer evaluates the candidate. If the student is accepted, the professor notifies the student. The student then completes his internship. "
-        "If the student is successful, he gets a passing grade'\n"
-        "Conditions: 'If the student is accepted','If the student is successful'\n"
-        "Exclusive gateway 1: If the student is accepted\n"
-        "Exclusive gateway 2: If the student is successful\n\n"
-
-        f"Process: '{process_description}'\n"
-        f"Conditions: {conditions}"
-    )
-
-    # Собираем prompt
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-    prompt = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Токенизация
-    inputs = tokenizer(prompt, return_tensors="pt").to(DEVICE)
-
-    # Генерация
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодирование и обрезка промпта
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(prompt):].strip()
-
-    return response
+# --- ФУНКЦИЯ УДАЛЕНА ---
+# def extract_gateway_conditions(condition_list_str: str, gateway_list_str: str) -> str:
+#     """
+#     Группирует УЖЕ ИЗВЛЕЧЕННЫЕ условия по УЖЕ ИЗВЛЕЧЕННЫМ шлюзам.
+#     (УДАЛЕНО - ненадежно, лучше делать в Python)
+#     """
+#     print(f"{Fore.YELLOW}Warning: LLM function 'extract_gateway_conditions' is deprecated and should not be called.{Fore.RESET}")
+#     return "" # Возвращаем пустую строку, если все же будет вызвана
+# --- КОНЕЦ УДАЛЕНИЯ ---
 
 
 def extract_parallel_gateways(process_description: str) -> str:
     """
-    Извлекает текст, относящийся к параллельным gateway'ам из описания бизнес-процесса, используя deepseek-llm-7b-chat.
+    Извлекает текст, относящийся к параллельным действиям (шлюзам).
     """
-    # Системный prompt
     system_prompt = (
-        "You are a highly experienced business process modelling expert, specializing in BPMN modelling. "
-        "You will be provided with a description of a complex business process and will need to extract the text "
-        "which belongs to a specific parallel gateway."
+        "You are a BPMN expert. Extract text spans describing activities performed **in parallel** or **concurrently**. "
+        "Look for keywords like 'meanwhile', 'at the same time', 'in parallel', 'while' (used for concurrency), 'concurrently', 'simultaneously'. "
+        "Include the text for all parallel branches belonging to the same concurrent execution block. "
+        "Format the output strictly as:\nParallel gateway 1: <text span 1>\nParallel gateway 2: <text span 2>\n... Output ONLY this structure."
     )
-
-    # Пользовательский prompt с примерами
     user_prompt = (
-        "Process: 'The professor sends the mail to the student. In the meantime, the student prepares his documents.'\n"
-        "Parallel gateway 1: The professor sends the mail to the student. In the meantime, the student prepares his documents.\n\n"
-        "Process: 'The credit analyst evaluates the creditworthiness and collateral of the applicant. Meanwhile, another team does the same. "
-        "After the application has been approved, one team verifies the applicant's employment while another team verifies the applicant's income detail simultaneously. "
-        "If both teams verify the information as accurate, the loan is approved and the process moves forward to the next step.'\n"
-        "Parallel gateway 1: The credit analyst evaluates the creditworthiness and collateral of the applicant. Meanwhile, another team does the same.\n"
-        "Parallel gateway 2: one team verifies the applicant's employment while another team verifies the applicant's income detail simultaneously.\n\n"
-        "Process: 'The process starts with the client discussing his ideas for the website. In the meantime, the agency presents potential solutions. "
-        "After that, the developers start working on the project while the client meets with the representatives on a regular basis.'\n"
-        "Parallel gateway 1: the client discussing his ideas for the website. In the meantime, the agency presents potential solutions.\n"
-        "Parallel gateway 2: the developers start working on the project while the client meets with the representatives on a regular basis\n\n"
-        "Process: 'The manager sends the mail to the supplier and prepares the documents. At the same time, the customer searches for the goods and picks up the goods.'\n"
-        "Parallel gateway 1: The manager sends the mail to the supplier and prepares the documents. At the same time, the customer searches for the goods and picks up the goods.\n\n"
-        "Process: 'The process starts when a group of chefs generate ideas for new dishes. At this point, 3 things occur in parallel: the first thing is the kitchen team analyzing the ideas for practicality. "
-        "The kitchen team also creates the recipe. The second path involves the customer service team conducting market research for the dishes. At the same time, the art team creates visual concepts for the potential dishes. "
-        "The third path sees the accountants reviewing the potential cost of the dishes. Once each track has completed its analysis, the management reviews the findings of the analysis.'\n"
-        "Parallel gateway 1: the first thing is the kitchen team analyzing the ideas for practicality. The kitchen team also creates the recipe. "
-        "The second path involves the customer service team conducting market research for the dishes. At the same time, the art team creates visual concepts for the potential dishes. "
-        "The third path sees the accountants reviewing the potential cost of the dishes\n\n"
-        "Process: 'The employee delivers the package. In the meantime, the customer pays for the service. Finally, the customer opens the package while the employee delivers the next package.'\n"
-        "Parallel gateway 1: The employee delivers the package. In the meantime, the customer pays for the service.\n"
-        "Parallel gateway 2: the customer opens the package while the employee delivers the next package.\n\n"
-        "Process: 'The project manager defines the requirements. The process then splits into 2 parallel paths: in the first path the front-end development team designs the user interface. "
-        "If the design is approved, the team implements it. If not, the team revises the design and continues to implement the approven parts of the design at the same time. "
-        "In the second parallel path the back-end development team builds the server-side functionality of the app. After the two parallel paths merge, the QA team test the app's performance.'\n"
-        "Parallel gateway 1: in the first path the front-end development team designs the user interface. If the design is approved, the team implements it. "
-        "If not, the team revises the design and continues to implement the approven parts of the design at the same time. "
-        "In the second parallel path the back-end development team builds the server-side functionality of the app.\n\n"
-        "Process: 'The process starts with the student choosing his preference. In the meantime, the professor prepares the necessary paperwork. "
-        "After that, the student starts his internship while the employer monitors the student's progress. Finally, the student completes his internship while the professor updates the database at the same time.'\n"
-        "Parallel gateway 1: The student choosing his preference. In the meantime, the professor prepares the necessary paperwork.\n"
-        "Parallel gateway 2: the student starts his internship while the employer monitors the student's progress.\n"
-        "Parallel gateway 3: the student completes his internship while the professor updates the database at the same time.\n\n"
-        "Process: 'The process starts when the employee starts the onboarding. In the meantime, the HR department handles the necessary paperwork. "
-        "After that, the manager provides the employee with his initial tasks and monitors the employee's progress at the same time.'\n"
-        "Parallel gateway 1: the employee starts the onboarding. In the meantime, the HR department handles the necessary paperwork.\n"
-        "Parallel gateway 2: the manager provides the employee with his initial tasks and monitors the employee's progress at the same time.\n\n"
+         # Примеры...
+        "Process: 'Analyst evaluates credit. Meanwhile, another team does the same. After approval, team A verifies employment while team B verifies income simultaneously.'\n"
+        "Parallel gateway 1: Analyst evaluates credit. Meanwhile, another team does the same.\n"
+        "Parallel gateway 2: team A verifies employment while team B verifies income simultaneously.\n\n"
+        "Process: 'Manager sends mail and prepares documents at the same time.'\n" # Пример с 'at the same time'
+        "Parallel gateway 1: Manager sends mail and prepares documents at the same time.\n\n"
         f"Process: '{process_description}'"
     )
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    return _generate_llm_response(messages, max_new_tokens=512)
 
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
 
-    # Преобразуем в формат модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-
-    # Токенизация
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
-
-    # Генерация текста
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=300,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодируем и обрезаем начало
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs):].strip()
-
-    return response
-
-def number_of_parallel_paths(parallel_gateway: str) -> str:
+def number_of_parallel_paths(parallel_gateway_text: str) -> str:
     """
-    Определяет количество параллельных путей в описании параллельного шлюза (parallel gateway).
-    Возвращает одно целое число в виде строки.
+    Определяет количество параллельных путей в описании шлюза.
     """
-    # Шаблон для запроса с примерами
-    user_prompt = (
-        "You will receive a description of a parallel gateway. Determine the number of parallel paths in the parallel gateway. "
-        "Respond with a single number in integer format.\n\n###\n\n"
-        "Parallel gateway: 'The R&D team researches and develops new technologies for the product. "
-        "The next thing happening in parallel is the UX team designing the user interface and user experience. "
-        "The interface has to be intuitive and user-friendly. The final thing occuring at the same time is when the QA team tests the product.'\n"
-        "Number of paths: 3\n\n"
-        "Parallel gateway: 'The credit analyst evaluates the creditworthiness and collateral of the applicant. Meanwhile, another team does the same.'\n"
-        "Number of paths: 2\n\n"
-        f"Parallel gateway: '{parallel_gateway}'\nNumber of paths:"
+    system_prompt = (
+        "Analyze the provided text describing parallel activities. Determine the number of distinct parallel paths/branches described. "
+        "Respond with a single digit only (e.g., '2', '3')."
     )
-
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": SYSTEM_MSG},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # Создаём input для модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
-
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=5,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодирование и извлечение числа
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs.input_ids[0]):].strip()
-
-    return response
+    user_prompt = (
+        # Примеры...
+        "Text: 'Team A does X. Team B does Y. Team C does Z simultaneously.'\n"
+        "Number: 3\n\n"
+        "Text: 'Evaluates creditworthiness and collateral. Meanwhile, another team does the same.'\n"
+        "Number: 2\n\n"
+        "Text: 'Sends email while preparing the report.'\n"
+        "Number: 2\n\n"
+        f"Text: '{parallel_gateway_text}'\n"
+        "Number:"
+    )
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    response = _generate_llm_response(messages, max_new_tokens=5)
+    # Валидация ответа - должен быть одной цифрой
+    if response.isdigit() and len(response) == 1:
+        return response
+    else:
+        print(f"{Fore.YELLOW}Warning: LLM returned non-digit for number_of_parallel_paths: '{response}'. Defaulting to 2.{Fore.RESET}")
+        return "2" # Возвращаем 2 по умолчанию при некорректном ответе
 
 
 def extract_parallel_tasks(sentence: str) -> str:
     """
-    Извлекает задачи, выполняющиеся параллельно, из предложенной фразы и выводит их в указанном формате.
+    Извлекает параллельные задачи из ОДНОГО предложения.
     """
-
     system_prompt = (
-        "You are an expert in analyzing and structuring business process sentences. "
-        "Given a sentence that includes multiple tasks being done in parallel, extract each task clearly. "
-        "Output should follow the format:\n"
-        "Task 1: <task>\nTask 2: <task>\n... as many tasks as necessary."
+        "You are an expert in structuring process sentences. Given a single sentence describing multiple tasks done concurrently, "
+        "extract each distinct task action. "
+        "Format the output strictly as:\nTask 1: <task description 1>\nTask 2: <task description 2>\n... Output ONLY this structure."
     )
-
-    # Шаблон для запроса с примерами
     user_prompt = (
-        'You will receive a sentence that contains multiple tasks being done in parallel.\n'
-        'Extract the tasks being done in parallel in the following format (the number of tasks may vary):\n'
-        'Task 1: <task>\nTask 2: <task>\n\n'
-        '###\n\n'
-        'Sentence: "The chef is simultaneously preparing the entree and dessert dishes."\n'
-        'Task 1: prepare the entree\n'
-        'Task 2: prepare the dessert dishes\n\n'
-        'Sentence: "The project manager coordinates with the design team, the development team and the QA team concurrently."\n'
-        'Task 1: coordinate with the design team\n'
-        'Task 2: coordinate with the development team\n'
-        'Task 3: coordinate with the QA team\n\n'
+        # Примеры...
+        'Sentence: "The chef simultaneously prepares the entree and makes the salad."\n'
+        'Task 1: prepares the entree\n'
+        'Task 2: makes the salad\n\n'
+        'Sentence: "Manager coordinates with design, development, and QA teams in parallel."\n'
+        'Task 1: coordinates with design team\n'
+        'Task 2: coordinates with development team\n'
+        'Task 3: coordinates with QA team\n\n'
         f'Sentence: "{sentence}"'
     )
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    return _generate_llm_response(messages, max_new_tokens=128)
 
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
 
-    # Создаём input для модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
-
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодирование и извлечение ответа
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs.input_ids[0]):].strip()
-
-    return response
-
-def extract_3_parallel_paths(parallel_gateway: str) -> str:
+def extract_3_parallel_paths(parallel_gateway_text: str) -> str:
     """
-    Извлекает 3 параллельных пути из описания процесса и возвращает их в нужном формате.
+    Извлекает 3 параллельных пути из текста шлюза.
     """
-
     system_prompt = (
-        "You are an assistant that extracts three parallel paths from a process description. "
-        "Return the spans in this format: <path> && <path> && <path>. Use '&&' only twice."
+        "You are a BPMN expert. From the provided text describing concurrent activities, extract exactly **three** distinct parallel paths. "
+        "Each path might contain multiple actions. "
+        "Separate the paths strictly using ' && ' (space, ampersands, space). Use ' && ' exactly twice. Output ONLY the paths in this format."
     )
-
-    # Шаблон для запроса
     user_prompt = (
-        "You will receive a process which contains 3 parallel paths.\n"
-        "Extract the 3 spans of text that belong to the 3 parallel paths in the following format: <path> && <path> && <path>\n"
-        "You must extract the entire span of text that belongs to a given path, not just a part of it.\n"
-        "Use the && symbols only twice.\n\n"
-        "###\n\n"
-        "Process: the first thing is the kitchen team analyzing the ideas for practicality. "
-        "The kitchen team also creates the recipe. The second path involves the customer service team conducting market research for the dishes. "
-        "At the same time, the art team creates visual concepts for the potential dishes. "
-        "The third path sees the accountants reviewing the potential cost of the dishes.\n"
-        "Paths: the kitchen team analyzing the ideas for practicality. The kitchen team also creates the recipe && "
-        "the customer service team conducting market research for the dishes. At the same time, the art team creates visual concepts for the potential dishes && "
-        "the accountants reviewing the potential cost of the dishes\n\n"
-        "Process: The R&D team researches and develops new technologies for the product. "
-        "The next thing happening in parallel is the UX team designing the user interface and user experience. "
-        "The interface has to be intuitive and user-friendly. The final thing occurring at the same time is when the QA team tests the product.\n"
-        "Paths: The R&D team researches and develops new technologies for the product && "
-        "the UX team designing the user interface and user experience && "
-        "the QA team tests the product\n\n"
-        f"Process: {parallel_gateway}\n"
+         # Примеры...
+        "Text: 'Path A: task A1, then A2. Path B: task B1. Path C: task C1, C2.'\n"
+        "Paths: Path A: task A1, then A2 && Path B: task B1 && Path C: task C1, C2\n\n"
+        "Text: 'Kitchen team analyzes ideas and creates recipe. Simultaneously, customer service does research while art team creates concepts. Concurrently, accountants review cost.'\n"
+        "Paths: Kitchen team analyzes ideas and creates recipe && customer service does research while art team creates concepts && accountants review cost\n\n"
+        f"Text: {parallel_gateway_text}\n"
         "Paths:"
     )
-
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # Создаём input для модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
-
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодирование и извлечение ответа
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs.input_ids[0]):].strip()
-
-    # Проверка, что модель вернула три пути
-    assert "&&" in response and response.count("&&") == 2, "Model did not return 3 parallel paths"
-    print("Parallel paths:", response, "\n")
-
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    response = _generate_llm_response(messages, max_new_tokens=384)
+    if response.count("&&") != 2:
+        print(f"{Fore.YELLOW}Warning: LLM response for 3 paths had {response.count('&&')} separators instead of 2.{Fore.RESET}")
     return response
 
 
-def extract_2_parallel_paths(parallel_gateway: str) -> str:
+def extract_2_parallel_paths(parallel_gateway_text: str) -> str:
     """
-    Извлекает 2 параллельных пути из описания процесса и возвращает их в нужном формате.
+    Извлекает 2 параллельных пути из текста шлюза.
     """
-
     system_prompt = (
-        "You are a highly experienced business process modelling expert, specializing in BPMN modelling. "
-        "You will be provided with a description of a complex business process which contains 2 parallel paths "
-        "and will need to extract the 2 spans of text that belong to the 2 parallel paths in the following format: <path> && <path>. "
-        "You must extract the entire span of text that belongs to a given path, not just a part of it. Use the && symbol exactly once."
+        "You are a BPMN expert. From the provided text describing concurrent activities, extract exactly **two** distinct parallel paths. "
+        "Each path might contain multiple actions. "
+        "Separate the paths strictly using ' && ' (space, ampersands, space). Use ' && ' exactly once. Output ONLY the paths in this format."
     )
-
-    # Шаблон для запроса
     user_prompt = (
-        "Process: After that, he delivers the mail and greets people. Simultaneously, the milkman delivers milk.\n"
-        "Paths: he delivers the mail and greets people && the milkman delivers milk\n\n"
-
-        "Process: There are 2 main things happening in parallel: the first thing is when John goes to the supermarket. "
-        "The second thing is when Amy goes to the doctor. Amy also calls John at the same time. After those 2 main things are done, John goes home.\n"
-        "Paths: John goes to the supermarket && Amy goes to the doctor. Amy also calls John at the same time.\n\n"
-
-        "Process: The team designs the interface. If it's approved, the team implements it. If not, the team revises the existing design "
-        "and starts drafting a new one in parallel.\n"
-        "Paths: the team revises the existing design && starts drafting a new one\n\n"
-
-        "Process: in the first path the front-end development team designs the user interface. If the design is approved, "
-        "the front-end development team implements it. If not, the front-end development team revises it and continues to implement "
-        "the approven parts of the design at the same time. In the second parallel path the front-end development team builds the server-side functionality of the mobile app.\n"
-        "Paths: the front-end development team designs the user interface. If the design is approved, the front-end development team implements it. "
-        "If not, the front-end development team revises it and continues to implement the approven parts of the design at the same time. "
-        "&& the front-end development team builds the server-side functionality of the mobile app.\n\n"
-
-        "Process: the team designs the user interface. If the design is approved, the team implements the design. "
-        "If not, the team revises the design and continues to implement the approven parts of the design at the same time.\n"
-        "Paths: the team revises the design && continues to implement the approven parts of the design\n\n"
-
-        "Process: The process is composed of 2 activities done concurrently: the first one is the customer filling out a loan application. "
-        "The second activity is a longer one, and it is composed of the manager deciding whether to prepare additional questions. "
-        "If yes, the manager prepares additional questions. If the decision is not to prepare, the manager sends an email and manager reads the newspaper at the same time. "
-        "After both activities have finished, the customer sends the application.\n"
-        "Paths: the customer filling out a loan application && the manager deciding whether to prepare additional questions. If yes, the manager prepares additional questions. "
-        "If the decision is not to prepare, the manager sends an email and manager reads the newspaper at the same time\n\n"
-
-        "Process: If the decision is not to prepare, the manager waits for the customer. After that, the manager sends an email. "
-        "While sending an email, the manager also reads a newspaper.\n"
-        "Paths: the manager sends an email && the manager also reads a newspaper\n\n"
-
-        f"Process: {parallel_gateway}\n"
+         # Примеры...
+        "Text: 'He delivers mail and greets people. Simultaneously, the milkman delivers milk.'\n"
+        "Paths: He delivers mail and greets people && the milkman delivers milk\n\n"
+        "Text: 'Team A revises the design while Team B implements approved parts.'\n"
+        "Paths: Team A revises the design && Team B implements approved parts\n\n"
+        f"Text: {parallel_gateway_text}\n"
         "Paths:"
     )
-
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": user_prompt}
-    ]
-
-    # Создаём input для модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
-
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=256,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
-
-    # Декодирование и извлечение ответа
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs.input_ids[0]):].strip()
-
-    # Проверка, что модель вернула два пути
-    assert "&&" in response and response.count("&&") == 1, "Model did not return 2 parallel paths"
-    print("Parallel paths:", response, "\n")
-
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    response = _generate_llm_response(messages, max_new_tokens=384)
+    if response.count("&&") != 1:
+         print(f"{Fore.YELLOW}Warning: LLM response for 2 paths had {response.count('&&')} separators instead of 1.{Fore.RESET}")
     return response
 
 
-def find_previous_task(task: str, previous_tasks: str) -> str:
+def find_previous_task(task_word: str, previous_tasks_str: str) -> str:
     """
-    Определяет наиболее вероятную прямую предшествующую задачу из списка возможных вариантов.
+    Определяет наиболее вероятную предшествующую задачу для цикла.
     """
-    # Шаблон для запроса
+    system_prompt = (
+        "You are a business process analyst. A task repeats (e.g., contains 'again', 'repeat'). You are given this repeating task and a list of previous tasks with IDs (e.g., T0: text). "
+        "Identify which previous task the repeating task should loop back to, considering the process flow. "
+        "Output ONLY the exact text of the selected previous task from the provided list."
+    )
     user_prompt = (
-        f"Task: '{task}'\n\n"
-        f"Choices:\n{previous_tasks}"
+        # Примеры...
+        "Repeating Task: 'discusses contract again with sales'\n"
+        "Previous Tasks:\n"
+        "T0: decide payment method\n"
+        "T1: fill loan application\n"
+        "T5: sign the contract\n" # <-- Target
+        "Selected Previous Task: sign the contract\n\n"
+
+        "Repeating Task: 'takes the exam again'\n"
+        "Previous Tasks:\n"
+        "T0: take the exam\n" # <-- Target
+        "T1: professor enters grade\n"
+        "Selected Previous Task: take the exam\n\n" # Предполагаем, что задача 'take the exam' была ранее
+
+        f"Repeating Task: '{task_word}'\n"
+        f"Previous Tasks:\n{previous_tasks_str}\n"
+        "Selected Previous Task:"
+    )
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+    return _generate_llm_response(messages, max_new_tokens=64)
+
+def determine_gateway_flow(gateway_id: str, conditions: list[str], subsequent_tasks: list[dict], context_text: str = "") -> str:
+    """
+    Использует LLM для определения начальных задач веток и точки слияния после шлюза.
+
+    Args:
+        gateway_id: ID расходящегося шлюза (например, EG0).
+        conditions: Список текстов условий для каждой ветки.
+        subsequent_tasks: Список словарей задач, следующих за шлюзом,
+                          каждый вида {"id": "T1", "text": "fill out form"}.
+        context_text: Опциональный контекстный текст процесса.
+
+    Returns:
+        Строка JSON с описанием начальных точек и слияния или пустая строка при ошибке.
+        Формат JSON:
+        {
+          "gateway_id": "...",
+          "branches": [
+            {"condition_index": 0, "immediate_task_id": "..."},
+            {"condition_index": 1, "immediate_task_id": "..."}
+          ],
+          "merge_task_id": "..." | null
+        }
+    """
+    if not model_loaded or (not conditions and gateway_id.startswith("EG")) or not subsequent_tasks: # Условиям нужен только XOR шлюз
+        print(f"{Fore.YELLOW}Warning: Missing prerequisites for LLM gateway flow call (model loaded: {model_loaded}, conditions: {bool(conditions)}, tasks: {bool(subsequent_tasks)}){Fore.RESET}")
+        return ""
+
+    system_prompt = (
+        "You are a BPMN expert analyzing process flows after a decision or parallel execution point (gateway).\n"
+        "You will be given the gateway ID, its conditions (if applicable), and a list of subsequent tasks with their IDs.\n"
+        "Your goal is to determine the IMMEDIATE task following each condition (or starting each parallel path) and the task where these paths MERGE, if any.\n"
+        "Output ONLY a valid JSON object adhering strictly to the specified format. Do not include any explanations or introductory text."
     )
 
-    # Формируем сообщения
-    messages = [
-        {"role": "system", "content": "You are a highly experienced business process analyst. "
-                                     "You will receive a description of a task and a list of possible preceding tasks. "
-                                     "Your job is to determine which task is the most likely direct predecessor. "
-                                     "Only return the exact text of the selected task from the choices."},
-        {"role": "user", "content": user_prompt}
-    ]
+    # Форматируем задачи и условия
+    task_list_str = "\n".join([f"- {task['id']}: {task['text']}" for task in subsequent_tasks])
+    condition_list_str = ""
+    if conditions: # Добавляем условия только если они есть (для XOR)
+        condition_list_str = "\n".join([f"- Condition {chr(65+i)}: {cond}" for i, cond in enumerate(conditions)])
+    else: # Для параллельных шлюзов
+         condition_list_str = "- N/A (Parallel Gateway)"
 
-    # Создаём input для модели
-    inputs = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-    inputs = tokenizer(inputs, return_tensors="pt").to(DEVICE)
 
-    # Генерация ответа
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=128,
-            temperature=0.0,
-            do_sample=False,
-            pad_token_id=tokenizer.eos_token_id
-        )
+    user_prompt = (
+        f"Gateway ID: {gateway_id}\n\n"
+        f"Conditions/Paths:\n{condition_list_str}\n\n"
+        f"Subsequent Tasks:\n{task_list_str}\n\n"
+        f"Context Text (optional):\n{context_text[:1000]}\n\n" # Ограничиваем длину контекста
+        "Determine the flow structure. "
+        "Identify the immediate task ID for each condition/path (A, B, ... or Path 1, Path 2 for parallel) and the merge task ID (use the task ID from the list, or null if no merge).\n"
+        "Output JSON format:\n"
+        "{\n"
+        '  "gateway_id": "...",\n'
+        '  "branches": [\n'
+        '    {"condition_index": 0, "immediate_task_id": "..."},\n' # Убрали sequence
+        '    {"condition_index": 1, "immediate_task_id": "..."}\n'
+        '  ],\n'
+        '  "merge_task_id": "..." | null\n'
+        "}\n\n"
+        "JSON Output:"
+    )
 
-    # Декодирование и извлечение ответа
-    decoded_output = tokenizer.decode(outputs[0], skip_special_tokens=True)
-    response = decoded_output[len(inputs.input_ids[0]):].strip()
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
 
-    print("Selected previous task:", response, "\n")
-    return response
+    response = _generate_llm_response(messages, max_new_tokens=256, temperature=0.1) # Снизим max_tokens и температуру
+
+    # Попытка извлечь JSON
+    try:
+        json_match = re.search(r'\{.*\}', response, re.DOTALL)
+        if json_match:
+            json_str = json_match.group(0)
+            try:
+                 # Базовая проверка ключей перед полным парсингом
+                 temp_data = json.loads(json_str)
+                 if "gateway_id" in temp_data and "branches" in temp_data and "merge_task_id" in temp_data:
+                     return json_str
+                 else:
+                      print(f"{Fore.YELLOW}Warning: LLM JSON response for gateway flow missing required keys:\n{json_str}{Fore.RESET}")
+                      return ""
+            except json.JSONDecodeError:
+                 print(f"{Fore.YELLOW}Warning: LLM response for gateway flow is not valid JSON:\n{response}{Fore.RESET}")
+                 return ""
+        else:
+            print(f"{Fore.YELLOW}Warning: Could not extract JSON from LLM response for gateway flow:\n{response}{Fore.RESET}")
+            return ""
+    except Exception as e:
+        print(f"{Fore.RED}Error processing LLM response for gateway flow: {e}{Fore.RESET}")
+        return ""
+
+
+# --- END: Добавление новой функции в deepseek_prompts.py ---

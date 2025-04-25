@@ -232,7 +232,7 @@ class BPMNValidator:
                      task_info = element.get("content", {}).get("task", {})
                      task_id_base = task_info.get("task_id")
                      if task_id_base:
-                          node_id = f"T_{task_id_base}"
+                          node_id = task_id_base
                           # ИЗМЕНЕНИЕ: Передаем сам элемент для информации
                           add_node_safe(node_id, type="task", label=task_info.get("word", "?"), validation_id=val_id, element_data=element)
                           graph_nodes_for_elem.append(node_id)
