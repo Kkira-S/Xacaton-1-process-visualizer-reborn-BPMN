@@ -1,0 +1,100 @@
+[
+    {
+        "entity_group": "AGENT",
+        "score": 0.9948328733444214,
+        "word": "The company",
+        "start": 0,
+        "end": 11
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9952451586723328,
+        "word": "receives the order",
+        "start": 12,
+        "end": 30
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.8445873856544495,
+        "word": "from the customer",
+        "start": 31,
+        "end": 48
+    },
+    {
+        "entity_group": "CONDITION",
+        "score": 0.9918044209480286,
+        "word": "If the product is out of stock",
+        "start": 50,
+        "end": 80
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9963350296020508,
+        "word": "the customer",
+        "start": 82,
+        "end": 94
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9942922592163086,
+        "word": "receives a notification",
+        "start": 95,
+        "end": 118
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.952078640460968,
+        "word": "that the order cannot be fulfilled",
+        "start": 119,
+        "end": 153
+    },
+    {
+        "entity_group": "CONDITION",
+        "score": 0.9921108484268188,
+        "word": "If the product is in stock and the payment succeeds",
+        "start": 155,
+        "end": 206
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9956557750701904,
+        "word": "the company",
+        "start": 208,
+        "end": 219
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9162611961364746,
+        "word": "processes and ships the order",
+        "start": 220,
+        "end": 249
+    },
+    {
+        "entity_group": "CONDITION",
+        "score": 0.9892467260360718,
+        "word": "If the product is in stock, but the payment fails",
+        "start": 251,
+        "end": 300
+    },
+    {
+        "entity_group": "AGENT",
+        "score": 0.9963288307189941,
+        "word": "the customer",
+        "start": 302,
+        "end": 314
+    },
+    {
+        "entity_group": "TASK",
+        "score": 0.9939107298851013,
+        "word": "receives a notification",
+        "start": 315,
+        "end": 338
+    },
+    {
+        "entity_group": "TASK_INFO",
+        "score": 0.9258677959442139,
+        "word": "that the order cannot be processed",
+        "start": 339,
+        "end": 373
+    }
+]
